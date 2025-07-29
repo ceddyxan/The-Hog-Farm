@@ -202,29 +202,74 @@ def main():
     # --- Sidebar for Hog Management, Deletion, and Import ---
     with st.sidebar.expander("Hog Management"):
         hog_id = st.text_input("Enter Hog ID to add:", "", key='add_hog_id_input')
-        if st.button("Add Hog", key='add_hog_button'):
-            if hog_id and hog_id not in st.session_state['hog_data']['Hog ID'].unique():
-                new_hog_df = pd.DataFrame([{'Hog ID': int(hog_id), 'Date': None, 'Weight (kg)': None}])
-                st.session_state['hog_data'] = pd.concat([st.session_state['hog_data'], new_hog_df], ignore_index=True)
-                save_data(st.session_state['hog_data'])
-                st.success(f"Hog {int(hog_id):03d} added!")
-            elif hog_id:
-                st.warning(f"Hog {int(hog_id):03d} already exists.")
+        
+        # Placeholder for add hog confirmation pop-up
+        add_hog_placeholder = st.empty()
+
+        if add_hog_placeholder.button("Add Hog", key='add_hog_button'):
+            if hog_id:
+                # Check if hog already exists before asking for confirmation
+                if hog_id not in st.session_state['hog_data']['Hog ID'].astype(str).unique():
+                    st.session_state['confirm_add_hog'] = True
+                    st.session_state['hog_id_to_add'] = hog_id
+                    st.rerun()
+                else:
+                    add_hog_placeholder.warning(f"Hog {int(hog_id):03d} already exists.")
             else:
-                st.warning("Please enter a Hog ID.")
+                add_hog_placeholder.warning("Please enter a Hog ID.")
+
+        if st.session_state.get('confirm_add_hog', False):
+            with add_hog_placeholder.container():
+                st.warning(f"Are you sure you want to add Hog: {int(st.session_state['hog_id_to_add']):03d}?")
+                col_confirm_add_hog_yes, col_confirm_add_hog_no = st.columns(2)
+                with col_confirm_add_hog_yes:
+                    if st.button("Yes, Add Hog", key='confirm_add_hog_yes'):
+                        new_hog_df = pd.DataFrame([{'Hog ID': int(st.session_state['hog_id_to_add']), 'Date': None, 'Weight (kg)': None}])
+                        st.session_state['hog_data'] = pd.concat([st.session_state['hog_data'], new_hog_df], ignore_index=True)
+                        save_data(st.session_state['hog_data'])
+                        st.success(f"Hog {int(st.session_state['hog_id_to_add']):03d} added!")
+                        del st.session_state['confirm_add_hog']
+                        del st.session_state['hog_id_to_add']
+                        st.rerun()
+                with col_confirm_add_hog_no:
+                    if st.button("No, Cancel", key='confirm_add_hog_no'):
+                        del st.session_state['confirm_add_hog']
+                        del st.session_state['hog_id_to_add']
+                        st.info("Hog addition cancelled.")
+                        st.rerun()
 
         formatted_hog_ids = [f'{int(hid):03d}' for hid in st.session_state['hog_data']['Hog ID'].unique() if pd.notna(hid)]
         hogs_to_remove_display = st.multiselect("Select Hog(s) to remove:", formatted_hog_ids, key='remove_hog_multiselect')
 
-        if st.button("Remove Selected Hog(s)", key='remove_hog_button'):
-            if hogs_to_remove_display:
-                hogs_to_remove_int = [int(hid) for hid in hogs_to_remove_display]
-                st.session_state['hog_data'] = st.session_state['hog_data'][~st.session_state['hog_data']['Hog ID'].isin(hogs_to_remove_int)]
-                st.session_state['hog_data'].dropna(subset=['Date', 'Weight (kg)'], inplace=True) 
-                save_data(st.session_state['hog_data'])
-                st.success(f"Hog(s) {', '.join(hogs_to_remove_display)} removed.")
-            else:
-                st.warning("Please select at least one hog to remove.")
+        # Placeholder for remove hog confirmation pop-up
+        remove_hog_placeholder = st.empty()
+
+        if hogs_to_remove_display:
+            if remove_hog_placeholder.button("Remove Selected Hog(s)", key='remove_hog_button'):
+                st.session_state['confirm_remove_hog'] = True
+                st.session_state['hogs_to_remove_display'] = hogs_to_remove_display # Store for rerun
+                st.rerun()
+
+        if st.session_state.get('confirm_remove_hog', False):
+            with remove_hog_placeholder.container():
+                st.warning(f"Are you sure you want to remove Hog(s): {', '.join(st.session_state['hogs_to_remove_display'])}? This action cannot be undone.")
+                col_confirm_remove_yes, col_confirm_remove_no = st.columns(2)
+                with col_confirm_remove_yes:
+                    if st.button("Yes, Remove", key='confirm_remove_hog_yes'):
+                        hogs_to_remove_int = [int(hid) for hid in st.session_state['hogs_to_remove_display']]
+                        st.session_state['hog_data'] = st.session_state['hog_data'][~st.session_state['hog_data']['Hog ID'].isin(hogs_to_remove_int)]
+                        st.session_state['hog_data'].dropna(subset=['Date', 'Weight (kg)'], inplace=True) 
+                        save_data(st.session_state['hog_data'])
+                        st.success(f"Hog(s) {', '.join(st.session_state['hogs_to_remove_display'])} removed.")
+                        del st.session_state['confirm_remove_hog']
+                        del st.session_state['hogs_to_remove_display']
+                        st.rerun()
+                with col_confirm_remove_no:
+                    if st.button("No, Cancel", key='confirm_remove_hog_no'):
+                        del st.session_state['confirm_remove_hog']
+                        del st.session_state['hogs_to_remove_display']
+                        st.info("Hog removal cancelled.")
+                        st.rerun()
 
     with st.sidebar.expander("Delete Weight Records"):
         delete_date = st.date_input("Select Date to Delete Records From:", value=None, key='delete_date_input')
@@ -232,27 +277,52 @@ def main():
                                             st.session_state['hog_data']['Hog ID'].unique(),
                                             key='delete_hog_ids_multiselect')
         
-        if st.button("Delete Selected Weight Records", key='delete_records_button'):
-            if delete_date or delete_hog_ids:
-                initial_row_count = len(st.session_state['hog_data'])
-                df = st.session_state['hog_data'].copy()
+        # Placeholder for delete records confirmation pop-up
+        delete_records_placeholder = st.empty()
 
-                if delete_date:
-                    df = df[df['Date'] != delete_date]
-                
-                if delete_hog_ids:
-                    df = df[~df['Hog ID'].isin(delete_hog_ids)]
+        if delete_date or delete_hog_ids:
+            if delete_records_placeholder.button("Delete Selected Weight Records", key='delete_records_button'):
+                st.session_state['confirm_delete_records'] = True
+                st.session_state['delete_date'] = delete_date # Store for rerun
+                st.session_state['delete_hog_ids'] = delete_hog_ids # Store for rerun
+                st.rerun()
 
-                deleted_row_count = initial_row_count - len(df)
-                st.session_state['hog_data'] = df
-                save_data(st.session_state['hog_data'])
+        if st.session_state.get('confirm_delete_records', False):
+            with delete_records_placeholder.container():
+                display_delete_date = st.session_state['delete_date'] if st.session_state['delete_date'] else 'All Dates'
+                display_delete_hog_ids = ', '.join([str(int(hid)) for hid in st.session_state['delete_hog_ids']]) if st.session_state['delete_hog_ids'] else 'All Hogs'
+                st.warning(f"Are you sure you want to delete records for Date: {display_delete_date} and Hog(s): {display_delete_hog_ids}? This action cannot be undone.")
+                col_confirm_delete_yes, col_confirm_delete_no = st.columns(2)
+                with col_confirm_delete_yes:
+                    if st.button("Yes, Delete", key='confirm_delete_records_yes'):
+                        initial_row_count = len(st.session_state['hog_data'])
+                        df = st.session_state['hog_data'].copy()
 
-                if deleted_row_count > 0:
-                    st.success(f"{deleted_row_count} record(s) deleted.")
-                else:
-                    st.info("No records found matching the criteria to delete.")
-            else:
-                st.warning("Please select a date or at least one hog to delete records.")
+                        if st.session_state['delete_date']:
+                            df = df[df['Date'] != st.session_state['delete_date']]
+                        
+                        if st.session_state['delete_hog_ids']:
+                            df = df[~df['Hog ID'].isin(st.session_state['delete_hog_ids'])]
+
+                        deleted_row_count = initial_row_count - len(df)
+                        st.session_state['hog_data'] = df
+                        save_data(st.session_state['hog_data'])
+
+                        if deleted_row_count > 0:
+                            st.success(f"{deleted_row_count} record(s) deleted.")
+                        else:
+                            st.info("No records found matching the criteria to delete.")
+                        del st.session_state['confirm_delete_records']
+                        del st.session_state['delete_date']
+                        del st.session_state['delete_hog_ids']
+                        st.rerun()
+                with col_confirm_delete_no:
+                    if st.button("No, Cancel", key='confirm_delete_records_no'):
+                        del st.session_state['confirm_delete_records']
+                        del st.session_state['delete_date']
+                        del st.session_state['delete_hog_ids']
+                        st.info("Deletion cancelled.")
+                        st.rerun()
 
     with st.sidebar.expander("Import Data"):
         uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx", "xls"], key='file_uploader')
@@ -377,16 +447,48 @@ def main():
                 weight = st.number_input("Weight (kg):", min_value=0.0, format="%.2f", key='record_weight')
 
             st.markdown("") # Add a bit of space
-            if st.button("Add Weight Record", key='add_record_button'):
+
+            # Placeholder for add weight record confirmation pop-up
+            add_weight_placeholder = st.empty()
+
+            if add_weight_placeholder.button("Add Weight Record", key='add_record_button'):
                 if selected_hog_id and measurement_date and weight > 0:
-                    new_record = pd.DataFrame([{'Hog ID': selected_hog_id, 'Date': measurement_date, 'Weight (kg)': weight}])
-                    st.session_state['hog_data'] = pd.concat([st.session_state['hog_data'], new_record], ignore_index=True)
-                    st.session_state['hog_data'].drop_duplicates(subset=['Hog ID', 'Date'], inplace=True, keep='last')
-                    st.session_state['hog_data'].sort_values(by=['Hog ID', 'Date'], inplace=True)
-                    save_data(st.session_state['hog_data'])
-                    st.success(f"Weight record added for Hog {selected_hog_id_formatted} on {measurement_date}.")
+                    st.session_state['confirm_add_weight'] = True
+                    st.session_state['selected_hog_id'] = selected_hog_id
+                    st.session_state['measurement_date'] = measurement_date
+                    st.session_state['weight'] = weight
+                    st.session_state['selected_hog_id_formatted'] = selected_hog_id_formatted
+                    st.rerun()
                 else:
-                    st.warning("Please fill in all fields (Hog ID, Date, Weight) and ensure weight is greater than 0.")
+                    add_weight_placeholder.warning("Please fill in all fields (Hog ID, Date, Weight) and ensure weight is greater than 0.")
+
+            if st.session_state.get('confirm_add_weight', False):
+                with add_weight_placeholder.container():
+                    st.warning(f"Are you sure you want to add a weight record for Hog: {st.session_state['selected_hog_id_formatted']} on {st.session_state['measurement_date']} with Weight: {st.session_state['weight']:.2f} kg?")
+                    col_confirm_weight_yes, col_confirm_weight_no = st.columns(2)
+                    with col_confirm_weight_yes:
+                        if st.button("Yes, Add Record", key='confirm_add_weight_yes'):
+                            new_record = pd.DataFrame([{'Hog ID': st.session_state['selected_hog_id'], 'Date': st.session_state['measurement_date'], 'Weight (kg)': st.session_state['weight']}])
+                            st.session_state['hog_data'] = pd.concat([st.session_state['hog_data'], new_record], ignore_index=True)
+                            st.session_state['hog_data'].drop_duplicates(subset=['Hog ID', 'Date'], inplace=True, keep='last')
+                            st.session_state['hog_data'].sort_values(by=['Hog ID', 'Date'], inplace=True)
+                            save_data(st.session_state['hog_data'])
+                            st.success(f"Weight record added for Hog {st.session_state['selected_hog_id_formatted']} on {st.session_state['measurement_date']}.")
+                            del st.session_state['confirm_add_weight']
+                            del st.session_state['selected_hog_id']
+                            del st.session_state['measurement_date']
+                            del st.session_state['weight']
+                            del st.session_state['selected_hog_id_formatted']
+                            st.rerun()
+                    with col_confirm_weight_no:
+                        if st.button("No, Cancel", key='confirm_add_weight_no'):
+                            del st.session_state['confirm_add_weight']
+                            del st.session_state['selected_hog_id']
+                            del st.session_state['measurement_date']
+                            del st.session_state['weight']
+                            del st.session_state['selected_hog_id_formatted']
+                            st.info("Weight record addition cancelled.")
+                            st.rerun()
         else:
             st.info("No hogs added yet. Please add a hog using the sidebar.")
 

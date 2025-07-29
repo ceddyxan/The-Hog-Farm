@@ -16,6 +16,7 @@ This is a standalone intelligent application for managing and analyzing hog weig
 - Export data to CSV/Excel.
 - Automatically highlight hogs with no weight gain for two consecutive weeks.
 - Provide an intelligent summary report with key insights.
+- **Enhanced Security Measures:** Confirmation pop-ups for adding/removing hogs and deleting weight records to prevent accidental data changes.
 
 ## Installation
 
@@ -54,6 +55,12 @@ streamlit run app.py
 ```
 
 This will open the application in your default web browser.
+
+If you'd like to see a deployed version of the app, visit: [https://the-hog-farm.streamlit.app/](https://the-hog-farm.streamlit.app/)
+
+## .gitignore
+
+A `.gitignore` file has been included to exclude common Python and Streamlit temporary files, as well as the `hog_data.csv` file, from version control. This ensures that only relevant code is tracked.
 
 ## Data Storage
 

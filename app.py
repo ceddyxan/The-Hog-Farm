@@ -10,7 +10,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import numpy as np
-import plotly.figure_factory as ff
 import io
 from supabase import create_client
 from dotenv import load_dotenv

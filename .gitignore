@@ -6,7 +6,29 @@ __pycache__/
 .Python
 env/
 venv/
+
+# Environment variables
 *.env
-.streamlit/secrets.toml
-.streamlit/
-hog_data.csv 
+.env.local
+.env.production
+
+# Streamlit
+.streamlit/config.toml
+.streamlit/cache/
+.streamlit/logs/
+.streamlit/uploads/
+
+# Data files (keep templates)
+*.csv.bak
+audit_log.json
+test_*.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

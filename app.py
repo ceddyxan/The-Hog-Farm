@@ -60,10 +60,21 @@ def init_supabase():
     """Initialize Supabase client"""
     # Try Streamlit secrets first (for production)
     try:
-        supabase_url = st.secrets["SUPABASE_URL"]
-        supabase_key = st.secrets["SUPABASE_KEY"]
-        st.info("🔗 Using Streamlit Cloud secrets")
-    except:
+        # Method 1: Direct access
+        supabase_url = st.secrets.get("SUPABASE_URL")
+        supabase_key = st.secrets.get("SUPABASE_KEY")
+        
+        if supabase_url and supabase_key:
+            st.info("🔗 Using Streamlit Cloud secrets (direct)")
+        else:
+            # Method 2: Try nested structure
+            supabase_url = st.secrets.get("supabase", {}).get("SUPABASE_URL")
+            supabase_key = st.secrets.get("supabase", {}).get("SUPABASE_KEY")
+            
+            if supabase_url and supabase_key:
+                st.info("🔗 Using Streamlit Cloud secrets (nested)")
+    except Exception as e:
+        st.warning(f"⚠️ Streamlit secrets error: {str(e)}")
         # Fallback to environment variables for local development
         load_dotenv()
         supabase_url = os.getenv('SUPABASE_URL')
@@ -75,6 +86,7 @@ def init_supabase():
         st.error("❌ Supabase credentials not found.")
         st.error("📋 For Streamlit Cloud: Add secrets in dashboard")
         st.error("📋 For Local: Set SUPABASE_URL and SUPABASE_KEY in .env")
+        st.info("🔍 Debug: Available secrets: " + str(list(st.secrets.keys())))
         return None
     
     try:

@@ -6,3 +6,6 @@ plotly
 openpyxl
 fpdf
 scipy
+supabase
+psycopg2-binary
+python-dotenv

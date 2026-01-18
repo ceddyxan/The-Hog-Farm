@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 import numpy as np
 import plotly.figure_factory as ff
 import io
+from supabase import create_client
+from dotenv import load_dotenv
+import json
 
 def format_number(n, decimals=0, is_currency=False):
     """
@@ -47,8 +50,216 @@ def format_hog_id(hog_id):
     except (ValueError, TypeError):
         return "-"
 
+# Database configuration
 DATA_FILE = 'hog_data.csv'
 FINANCIAL_DATA_FILE = 'financial_data.csv'
+BUDGETS_FILE = 'budgets.csv'
+
+# Supabase connection
+@st.cache_resource
+def init_supabase():
+    """Initialize Supabase client"""
+    load_dotenv()
+    supabase_url = os.getenv('SUPABASE_URL')
+    supabase_key = os.getenv('SUPABASE_KEY')
+    
+    if not supabase_url or not supabase_key:
+        st.error("❌ Supabase credentials not found. Please set SUPABASE_URL and SUPABASE_KEY in your environment variables.")
+        return None
+    
+    try:
+        return create_client(supabase_url, supabase_key)
+    except Exception as e:
+        st.error(f"❌ Failed to connect to Supabase: {str(e)}")
+        st.info("🔄 Falling back to CSV storage. Your data will be saved locally.")
+        return None
+
+# Initialize Supabase client
+supabase = init_supabase()
+
+# Database utility functions
+def load_hogs_from_db():
+    """Load all hogs from Supabase"""
+    if not supabase:
+        return pd.DataFrame(columns=['hog_id'])
+    
+    try:
+        response = supabase.table('hogs').select('*').execute()
+        if response.data:
+            return pd.DataFrame(response.data)
+        return pd.DataFrame(columns=['hog_id'])
+    except Exception as e:
+        st.error(f"❌ Failed to load hogs: {str(e)}")
+        return pd.DataFrame(columns=['hog_id'])
+
+def load_weight_measurements_from_db():
+    """Load all weight measurements from Supabase"""
+    if not supabase:
+        return pd.DataFrame(columns=['hog_id', 'measurement_date', 'weight_kg'])
+    
+    try:
+        response = supabase.table('weight_measurements').select('*').order('measurement_date').execute()
+        if response.data:
+            df = pd.DataFrame(response.data)
+            # Convert to match original CSV format
+            df = df.rename(columns={
+                'measurement_date': 'Date',
+                'weight_kg': 'Weight (kg)',
+                'hog_id': 'Hog ID'
+            })
+            df['Date'] = pd.to_datetime(df['Date']).dt.date
+            return df[['Hog ID', 'Date', 'Weight (kg)']]
+        return pd.DataFrame(columns=['Hog ID', 'Date', 'Weight (kg)'])
+    except Exception as e:
+        st.error(f"❌ Failed to load weight measurements: {str(e)}")
+        return pd.DataFrame(columns=['Hog ID', 'Date', 'Weight (kg)'])
+
+def save_weight_measurement_to_db(hog_id, date, weight):
+    """Save a weight measurement to Supabase"""
+    if not supabase:
+        return False
+    
+    try:
+        # Check if measurement already exists
+        existing = supabase.table('weight_measurements').select('*').eq('hog_id', hog_id).eq('measurement_date', date).execute()
+        
+        if existing.data:
+            # Update existing measurement
+            response = supabase.table('weight_measurements').update({
+                'weight_kg': weight
+            }).eq('hog_id', hog_id).eq('measurement_date', date).execute()
+        else:
+            # Insert new measurement
+            response = supabase.table('weight_measurements').insert({
+                'hog_id': hog_id,
+                'measurement_date': date,
+                'weight_kg': weight
+            }).execute()
+        
+        return True
+    except Exception as e:
+        st.error(f"❌ Failed to save weight measurement: {str(e)}")
+        return False
+
+def add_hog_to_db(hog_id):
+    """Add a new hog to Supabase"""
+    if not supabase:
+        return False
+    
+    try:
+        response = supabase.table('hogs').insert({'hog_id': hog_id}).execute()
+        return True
+    except Exception as e:
+        st.error(f"❌ Failed to add hog: {str(e)}")
+        return False
+
+def remove_hog_from_db(hog_id):
+    """Remove a hog and all its measurements from Supabase"""
+    if not supabase:
+        return False
+    
+    try:
+        # Delete all weight measurements for this hog
+        supabase.table('weight_measurements').delete().eq('hog_id', hog_id).execute()
+        # Delete the hog
+        supabase.table('hogs').delete().eq('hog_id', hog_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"❌ Failed to remove hog: {str(e)}")
+        return False
+
+def load_financial_data_from_db():
+    """Load financial data from Supabase"""
+    if not supabase:
+        return pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
+    
+    try:
+        response = supabase.table('financial_transactions').select('*').order('transaction_date').execute()
+        if response.data:
+            df = pd.DataFrame(response.data)
+            # Convert to match original CSV format
+            df = df.rename(columns={
+                'transaction_date': 'Date',
+                'transaction_type': 'Type',
+                'category': 'Category',
+                'subcategory': 'Subcategory',
+                'description': 'Description',
+                'hog_id': 'Hog ID',
+                'weight_kg': 'Weight (kg)',
+                'price_per_kg': 'Price/kg',
+                'amount': 'Amount',
+                'buyer': 'Buyer'
+            })
+            df['Date'] = pd.to_datetime(df['Date']).dt.date
+            return df[['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory']]
+        return pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
+    except Exception as e:
+        st.error(f"❌ Failed to load financial data: {str(e)}")
+        return pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
+
+def save_financial_transaction_to_db(transaction_data):
+    """Save financial transaction to Supabase"""
+    if not supabase:
+        return False
+    
+    try:
+        # Convert from CSV format to DB format
+        db_data = {
+            'transaction_date': transaction_data['Date'],
+            'transaction_type': transaction_data['Type'],
+            'category': transaction_data['Category'],
+            'subcategory': transaction_data.get('Subcategory'),
+            'description': transaction_data['Description'],
+            'hog_id': transaction_data.get('Hog ID'),
+            'weight_kg': transaction_data.get('Weight (kg)'),
+            'price_per_kg': transaction_data.get('Price/kg'),
+            'amount': transaction_data['Amount'],
+            'buyer': transaction_data.get('Buyer')
+        }
+        
+        response = supabase.table('financial_transactions').insert(db_data).execute()
+        return True
+    except Exception as e:
+        st.error(f"❌ Failed to save financial transaction: {str(e)}")
+        return False
+
+# Migration helper functions
+def migrate_csv_to_supabase():
+    """Migrate existing CSV data to Supabase"""
+    if not supabase:
+        st.error("❌ Cannot migrate: Supabase not connected")
+        return False
+    
+    try:
+        # Migrate hogs
+        if os.path.exists(DATA_FILE):
+            hog_df = pd.read_csv(DATA_FILE)
+            unique_hogs = hog_df['Hog ID'].unique()
+            
+            for hog_id in unique_hogs:
+                add_hog_to_db(int(hog_id))
+            
+            # Migrate weight measurements
+            for _, row in hog_df.iterrows():
+                save_weight_measurement_to_db(
+                    int(row['Hog ID']),
+                    row['Date'],
+                    float(row['Weight (kg)'])
+                )
+        
+        # Migrate financial data
+        if os.path.exists(FINANCIAL_DATA_FILE):
+            financial_df = pd.read_csv(FINANCIAL_DATA_FILE)
+            if not financial_df.empty:
+                for _, row in financial_df.iterrows():
+                    save_financial_transaction_to_db(row.to_dict())
+        
+        st.success("✅ Migration completed successfully!")
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Migration failed: {str(e)}")
+        return False
 
 st.set_page_config(layout="wide", page_title="Hog Weight Tracking App", page_icon="🐖")
 
@@ -171,6 +382,14 @@ h1, h2, h3, h4, h5, h6 {
 """, unsafe_allow_html=True)
 
 def load_data():
+    """Load hog data -优先使用 Supabase，回退到 CSV"""
+    # Try Supabase first if available
+    if supabase:
+        db_data = load_weight_measurements_from_db()
+        if not db_data.empty:
+            return db_data
+    
+    # Fallback to CSV if Supabase is not available or has no data
     if os.path.exists(DATA_FILE):
         df = pd.read_csv(DATA_FILE)
         df['Date'] = pd.to_datetime(df['Date']).dt.date # Ensure date format consistency
@@ -178,9 +397,89 @@ def load_data():
     return pd.DataFrame(columns=['Hog ID', 'Date', 'Weight (kg)'])
 
 def save_data(df):
-    df.to_csv(DATA_FILE, index=False)
+    """
+    Save hog data - 优先使用 Supabase，回退到 CSV
+    """
+    # Try Supabase first if available
+    if supabase:
+        try:
+            # Save each row to Supabase
+            for _, row in df.iterrows():
+                save_weight_measurement_to_db(
+                    int(row['Hog ID']),
+                    row['Date'],
+                    float(row['Weight (kg)'])
+                )
+            return True
+        except Exception as e:
+            st.error(f"❌ Failed to save to Supabase: {str(e)}")
+            # Fall back to CSV
+    
+    # Fallback to CSV if Supabase is not available or failed
+    try:
+        # Create backup of existing data before saving
+        if os.path.exists(DATA_FILE):
+            backup_file = f"{DATA_FILE}.backup"
+            import shutil
+            shutil.copy2(DATA_FILE, backup_file)
+        
+        # Save data
+        df.to_csv(DATA_FILE, index=False)
+        
+        # Verify save was successful by reading it back
+        verification_df = pd.read_csv(DATA_FILE)
+        if len(verification_df) != len(df):
+            raise Exception("Data verification failed: Saved data doesn't match original")
+            
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Failed to save hog data: {str(e)}")
+        # Try to restore from backup if it exists
+        backup_file = f"{DATA_FILE}.backup"
+        if os.path.exists(backup_file):
+            try:
+                import shutil
+                shutil.copy2(backup_file, DATA_FILE)
+                st.info("🔄 Restored data from backup due to save failure")
+            except:
+                st.error("❌ Could not restore data from backup")
+        return False
+
+def validate_hog_data_consistency():
+    """
+    Validate that session state hog data matches CSV data to detect inconsistencies
+    """
+    try:
+        # Load fresh data from CSV
+        csv_data = load_data()
+        session_data = st.session_state.get('hog_data', pd.DataFrame())
+        
+        # Compare record counts
+        csv_count = len(csv_data)
+        session_count = len(session_data)
+        
+        if csv_count != session_count:
+            st.warning(f"⚠️ Hog data inconsistency detected: CSV has {csv_count} records, session has {session_count}. Refreshing data...")
+            st.session_state['hog_data'] = csv_data
+            return False
+        
+        # If we get here, data is consistent
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error validating hog data consistency: {str(e)}")
+        return False
 
 def load_financial_data():
+    """Load financial data - 优先使用 Supabase，回退到 CSV"""
+    # Try Supabase first if available
+    if supabase:
+        db_data = load_financial_data_from_db()
+        if not db_data.empty:
+            return db_data
+    
+    # Fallback to CSV if Supabase is not available or has no data
     if os.path.exists(FINANCIAL_DATA_FILE):
         df = pd.read_csv(FINANCIAL_DATA_FILE)
         df['Date'] = pd.to_datetime(df['Date']).dt.date
@@ -192,7 +491,152 @@ def load_financial_data():
     return pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount'])
 
 def save_financial_data(df):
-    df.to_csv(FINANCIAL_DATA_FILE, index=False)
+    """
+    Save financial data - 优先使用 Supabase，回退到 CSV
+    """
+    # Try Supabase first if available
+    if supabase:
+        try:
+            # Save each row to Supabase
+            for _, row in df.iterrows():
+                save_financial_transaction_to_db(row.to_dict())
+            return True
+        except Exception as e:
+            st.error(f"❌ Failed to save to Supabase: {str(e)}")
+            # Fall back to CSV
+    
+    # Fallback to CSV if Supabase is not available or failed
+    try:
+        # Create backup of existing data before saving
+        if os.path.exists(FINANCIAL_DATA_FILE):
+            backup_file = f"{FINANCIAL_DATA_FILE}.backup"
+            import shutil
+            shutil.copy2(FINANCIAL_DATA_FILE, backup_file)
+        
+        # Save data
+        df.to_csv(FINANCIAL_DATA_FILE, index=False)
+        
+        # Verify the save was successful by reading it back
+        verification_df = pd.read_csv(FINANCIAL_DATA_FILE)
+        if len(verification_df) != len(df):
+            raise Exception("Data verification failed: Saved data doesn't match original")
+            
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Failed to save financial data: {str(e)}")
+        # Try to restore from backup if it exists
+        backup_file = f"{FINANCIAL_DATA_FILE}.backup"
+        if os.path.exists(backup_file):
+            try:
+                import shutil
+                shutil.copy2(backup_file, FINANCIAL_DATA_FILE)
+                st.info("🔄 Restored data from backup due to save failure")
+            except:
+                st.error("❌ Could not restore data from backup")
+        return False
+
+def load_budgets_data():
+    """
+    Load budget data from CSV with enhanced error handling
+    """
+    try:
+        if os.path.exists(BUDGETS_FILE):
+            df = pd.read_csv(BUDGETS_FILE)
+            # Ensure all expected columns exist
+            for col in ['Category', 'Month', 'Budget']:
+                if col not in df.columns:
+                    df[col] = pd.NA
+            return df
+        else:
+            return pd.DataFrame(columns=['Category', 'Month', 'Budget'])
+    except Exception as e:
+        st.error(f"❌ Error loading budget data: {str(e)}")
+        return pd.DataFrame(columns=['Category', 'Month', 'Budget'])
+
+def save_budgets_data(df):
+    """
+    Save budget data to CSV with enhanced error handling and validation
+    """
+    try:
+        # Create backup of existing data before saving
+        if os.path.exists(BUDGETS_FILE):
+            backup_file = f"{BUDGETS_FILE}.backup"
+            import shutil
+            shutil.copy2(BUDGETS_FILE, backup_file)
+        
+        # Save data
+        df.to_csv(BUDGETS_FILE, index=False)
+        
+        # Verify save was successful by reading it back
+        verification_df = pd.read_csv(BUDGETS_FILE)
+        if len(verification_df) != len(df):
+            raise Exception("Budget data verification failed: Saved data doesn't match original")
+            
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Failed to save budget data: {str(e)}")
+        # Try to restore from backup if it exists
+        backup_file = f"{BUDGETS_FILE}.backup"
+        if os.path.exists(backup_file):
+            try:
+                import shutil
+                shutil.copy2(backup_file, BUDGETS_FILE)
+                st.info("🔄 Restored budget data from backup due to save failure")
+            except:
+                st.error("❌ Could not restore budget data from backup")
+        return False
+
+def validate_budgets_data_consistency():
+    """
+    Validate that session state budget data matches CSV data to detect inconsistencies
+    """
+    try:
+        # Load fresh data from CSV
+        csv_data = load_budgets_data()
+        session_data = st.session_state.get('budgets', pd.DataFrame())
+        
+        # Compare record counts
+        csv_count = len(csv_data)
+        session_count = len(session_data)
+        
+        if csv_count != session_count:
+            st.warning(f"⚠️ Budget data inconsistency detected: CSV has {csv_count} records, session has {session_count}. Refreshing data...")
+            st.session_state['budgets'] = csv_data
+            return False
+        
+        # If we get here, data is consistent
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error validating budget data consistency: {str(e)}")
+        return False
+
+def validate_financial_data_consistency():
+    """
+    Validate that session state financial data matches CSV data to detect inconsistencies
+    """
+    try:
+        # Load fresh data from CSV
+        csv_data = load_financial_data()
+        session_data = st.session_state.get('financial_data', pd.DataFrame())
+        
+        # Compare record counts
+        csv_count = len(csv_data)
+        session_count = len(session_data)
+        
+        if csv_count != session_count:
+            st.warning(f"⚠️ Data inconsistency detected: CSV has {csv_count} records, session has {session_count}. Refreshing data...")
+            st.session_state['financial_data'] = csv_data
+            return False
+        
+        # If we get here, data is consistent
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error validating data consistency: {str(e)}")
+        return False
 
 def no_growth_summary(no_gain_data):
     """
@@ -566,17 +1010,28 @@ def main():
 
     # Robust error handling for data loading (must be before sidebar uses hog_data/financial_data)
     try:
-        if 'hog_data' not in st.session_state:
-            st.session_state['hog_data'] = load_data()
+        # Always reload data from CSV to ensure we have the latest data
+        st.session_state['hog_data'] = load_data()
+        # Validate data consistency
+        validate_hog_data_consistency()
     except Exception as e:
         st.session_state['hog_data'] = pd.DataFrame(columns=['Hog ID', 'Date', 'Weight (kg)'])
         st.error(f"Error loading hog data: {e}")
 
     try:
-        if 'financial_data' not in st.session_state:
-            st.session_state['financial_data'] = load_financial_data()
+        # Always reload data from CSV to ensure we have the latest data
+        st.session_state['budgets'] = load_budgets_data()
+        # Validate data consistency
+        validate_budgets_data_consistency()
     except Exception as e:
-        st.session_state['financial_data'] = pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount'])
+        st.session_state['budgets'] = pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount'])
+        st.error(f"Error loading budget data: {e}")
+
+    try:
+        # Always reload financial data from CSV to ensure we have the latest data
+        st.session_state['financial_data'] = load_financial_data()
+    except Exception as e:
+        st.session_state['financial_data'] = pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
         st.error(f"Error loading financial data: {e}")
 
     # --- Sidebar Layout ---
@@ -660,10 +1115,20 @@ def main():
                         with col_confirm_add_hog_yes:
                             if st.button("Yes", key='confirm_add_hog_yes_sidebar'):
                                 try:
-                                    new_hog_df = pd.DataFrame([{'Hog ID': int(st.session_state['hog_id_to_add_sidebar']), 'Date': None, 'Weight (kg)': None}])
-                                    st.session_state['hog_data'] = pd.concat([st.session_state['hog_data'], new_hog_df], ignore_index=True)
-                                    save_data(st.session_state['hog_data'])
-                                    st.success(f"Hog {int(st.session_state['hog_id_to_add_sidebar']):03d} added!")
+                                    hog_id_to_add = int(st.session_state['hog_id_to_add_sidebar'])
+                                    
+                                    # Try to add to Supabase first
+                                    if supabase and add_hog_to_db(hog_id_to_add):
+                                        st.success(f"Hog {hog_id_to_add:03d} added to database!")
+                                    else:
+                                        # Fallback to local data
+                                        new_hog_df = pd.DataFrame([{'Hog ID': hog_id_to_add, 'Date': None, 'Weight (kg)': None}])
+                                        st.session_state['hog_data'] = pd.concat([st.session_state['hog_data'], new_hog_df], ignore_index=True)
+                                        save_data(st.session_state['hog_data'])
+                                        st.success(f"Hog {hog_id_to_add:03d} added locally!")
+                                    
+                                    # Refresh data to show new hog
+                                    st.session_state['hog_data'] = load_data()
                                 except Exception as e:
                                     st.error(f"Error adding hog: {e}")
                                 finally:
@@ -692,10 +1157,26 @@ def main():
                         with col_confirm_remove_yes:
                             if st.button("Yes", key='confirm_remove_hog_yes_sidebar'):
                                 hogs_to_remove_int = [int(hid) for hid in st.session_state['hogs_to_remove_display_sidebar']]
-                                st.session_state['hog_data'] = st.session_state['hog_data'][~st.session_state['hog_data']['Hog ID'].isin(hogs_to_remove_int)]
-                                st.session_state['hog_data'].dropna(subset=['Date', 'Weight (kg)'], inplace=True)
-                                save_data(st.session_state['hog_data'])
-                                st.success(f"Hog(s) {', '.join(st.session_state['hogs_to_remove_display_sidebar'])} removed.")
+                                
+                                # Try to remove from Supabase first
+                                success = True
+                                if supabase:
+                                    for hog_id in hogs_to_remove_int:
+                                        if not remove_hog_from_db(hog_id):
+                                            success = False
+                                            break
+                                
+                                if success:
+                                    st.success(f"Hog(s) {', '.join(st.session_state['hogs_to_remove_display_sidebar'])} removed from database!")
+                                else:
+                                    # Fallback to local data
+                                    st.session_state['hog_data'] = st.session_state['hog_data'][~st.session_state['hog_data']['Hog ID'].isin(hogs_to_remove_int)]
+                                    st.session_state['hog_data'].dropna(subset=['Date', 'Weight (kg)'], inplace=True)
+                                    save_data(st.session_state['hog_data'])
+                                    st.success(f"Hog(s) {', '.join(st.session_state['hogs_to_remove_display_sidebar'])} removed locally!")
+                                
+                                # Refresh data to show removal
+                                st.session_state['hog_data'] = load_data()
                                 del st.session_state['confirm_remove_hog_sidebar']
                                 del st.session_state['hogs_to_remove_display_sidebar']
                                 st.rerun()
@@ -848,18 +1329,22 @@ def main():
 
     # Robust error handling for data loading
     try:
-        if 'hog_data' not in st.session_state:
-            st.session_state['hog_data'] = load_data()
+        # Always reload data from CSV to ensure we have the latest data
+        st.session_state['hog_data'] = load_data()
+        # Validate data consistency
+        validate_hog_data_consistency()
     except Exception as e:
         st.session_state['hog_data'] = pd.DataFrame(columns=['Hog ID', 'Date', 'Weight (kg)'])
         st.error(f"Error loading hog data: {e}")
 
     try:
-        if 'financial_data' not in st.session_state:
-            st.session_state['financial_data'] = load_financial_data()
+        # Always reload data from CSV to ensure we have the latest data
+        st.session_state['budgets'] = load_budgets_data()
+        # Validate data consistency
+        validate_budgets_data_consistency()
     except Exception as e:
-        st.session_state['financial_data'] = pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount'])
-        st.error(f"Error loading financial data: {e}")
+        st.session_state['budgets'] = pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount'])
+        st.error(f"Error loading budget data: {e}")
 
     # --- Make display_data available to all tabs and roles ---
     display_data = st.session_state['hog_data'].dropna(subset=['Hog ID', 'Date', 'Weight (kg)'])
@@ -4142,6 +4627,10 @@ def main():
                                 ignore_index=True
                             )
                             save_financial_data(st.session_state['financial_data'])
+                            
+                            # Force refresh of financial data from CSV to ensure consistency
+                            st.session_state['financial_data'] = load_financial_data()
+                            
                             st.success("✅ Expense added successfully!")
                             st.balloons()
                             
@@ -4154,55 +4643,224 @@ def main():
                             
                             # Force a rerun to update the UI with default values
                             st.rerun()
-                            
                         except Exception as e:
                             st.error(f"❌ An error occurred while saving the expense: {str(e)}")
+        
+        # --- Expense Analytics Section ---
+        # Initialize variables with default values
+        total_expenses = 0
+        avg_expense = 0
+        expense_count = 0
+        expenses_df = pd.DataFrame()
+        category_summary = pd.DataFrame(columns=['Category', 'Total Amount', 'Number of Expenses'])
+        
+        if not st.session_state['financial_data'].empty:
+            expenses_df = st.session_state['financial_data'][st.session_state['financial_data']['Type'] == 'Expense'].copy()
             
-            # Divider before the next section
-            # --- Expense Analytics Section ---
-            if not st.session_state['financial_data'].empty:
-                expenses_df = st.session_state['financial_data'][st.session_state['financial_data']['Type'] == 'Expense'].copy()
+            if not expenses_df.empty:
+                # Calculate summary metrics
+                total_expenses = expenses_df['Amount'].sum()
+                avg_expense = expenses_df['Amount'].mean()
+                expense_count = len(expenses_df)
                 
-                if not expenses_df.empty:
-                    # Convert date to datetime if it's not already
-                    expenses_df['Date'] = pd.to_datetime(expenses_df['Date'])
-                    
-                    # --- Summary Cards ---
-                    st.markdown("### 📊 Expense Summary")
-                    
-                    # Calculate summary metrics
-                    total_expenses = expenses_df['Amount'].sum()
-                    avg_expense = expenses_df['Amount'].mean()
-                    expense_count = len(expenses_df)
-                    
-                    # Create summary cards
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
+                # Create summary cards
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric(
+                        label="Total Expenses",
+                        value=f"Kshs {total_expenses:,.2f}",
+                        help="Sum of all recorded expenses"
+                    )
+                
+                with col2:
+                    st.metric(
+                        label="Average Expense",
+                        value=f"Kshs {avg_expense:,.2f}",
+                        help="Average amount per expense"
+                    )
+                
+                with col3:
+                    st.metric(
+                        label="Total Records",
+                        value=f"{expense_count:,}",
+                        help="Number of expense records"
+                    )
+        
+        # --- Expense Category Breakdown ---
+        st.markdown("### 📈 Expense Analysis")
+        
+        # Create tabs for different visualizations
+        tab1, tab2 = st.tabs(["By Category", "Over Time"])
+        
+        with tab1:
+            st.markdown("#### 🥧 Expense Distribution by Category")
+            if not expenses_df.empty and 'Category' in expenses_df.columns:
+                category_summary = expenses_df.groupby('Category')['Amount'].agg(['sum', 'count']).reset_index()
+                category_summary.columns = ['Category', 'Total Amount', 'Number of Expenses']
+                category_summary = category_summary.sort_values('Total Amount', ascending=False)
+            
+            # Display top categories as metrics
+            if not category_summary.empty:
+                top_categories = category_summary.head(3)
+                cols = st.columns(3)
+                for idx, (_, row) in enumerate(top_categories.iterrows()):
+                    with cols[idx % 3]:
+                        percentage = (row['Total Amount'] / total_expenses) * 100 if total_expenses > 0 else 0
                         st.metric(
-                            label="Total Expenses",
-                            value=f"Kshs {total_expenses:,.2f}",
-                            help="Sum of all recorded expenses"
+                            label=f"{row['Category']}",
+                            value=f"Kshs {row['Total Amount']:,.2f}",
+                            delta=f"{percentage:.1f}% of total"
                         )
+            
+            # Show full category breakdown in columns
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                st.markdown("#### 📋 Category Details")
+                if not category_summary.empty:
+                    st.dataframe(
+                        category_summary.rename(columns={
+                            'Category': 'Category',
+                            'Total Amount': 'Total (Kshs)',
+                            'Number of Expenses': 'Count'
+                        }).style.format({
+                            'Total (Kshs)': '{:,.2f}'
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("No expense data available to display.")
+            
+            with col2:
+                st.markdown("#### 📊 Distribution")
+                if not category_summary.empty:
+                    fig_pie = px.pie(
+                        category_summary,
+                        values='Total Amount',
+                        names='Category',
+                        color_discrete_sequence=px.colors.qualitative.Pastel,
+                        hole=0.3
+                    )
+                    fig_pie.update_traces(
+                        textposition='inside',
+                        textinfo='percent+label',
+                        hovertemplate='%{label}<br>Kshs %{value:,.2f}<br>%{percent}'
+                    )
+                    fig_pie.update_layout(
+                        showlegend=False,
+                        margin=dict(t=0, b=0, l=0, r=0)
+                    )
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                else:
+                    st.info("No expense data available for chart.")
+        
+        with tab2:
+            st.markdown("#### 📅 Monthly Expense Trends")
+            
+            if not expenses_df.empty and 'Date' in expenses_df.columns:
+                # Group by month and category
+                monthly_expenses = expenses_df.copy()
+                monthly_expenses['Month'] = monthly_expenses['Date'].dt.to_period('M').astype(str)
+                monthly_summary = monthly_expenses.groupby(['Month', 'Category'])['Amount'].sum().reset_index()
+                
+                # Create line chart
+                fig_line = px.line(
+                    monthly_summary,
+                    x='Month',
+                    y='Amount',
+                    color='Category',
+                    title="Monthly Expenses by Category",
+                    markers=True,
+                    color_discrete_sequence=px.colors.qualitative.Pastel
+                )
+                fig_line.update_layout(
+                    xaxis_title="Month",
+                    yaxis_title="Amount (Kshs)",
+                    legend_title="Category",
+                    hovermode='x unified'
+                )
+                fig_line.update_traces(
+                    hovertemplate='%{x}<br>Kshs %{y:,.2f}<extra></extra>'
+                )
+                st.plotly_chart(fig_line, use_container_width=True)
+                
+                # Monthly summary table
+                st.markdown("#### 📅 Monthly Summary")
+                monthly_totals = monthly_expenses.groupby('Month')['Amount'].agg(['sum', 'count']).reset_index()
+                monthly_totals.columns = ['Month', 'Total Amount', 'Number of Expenses']
+                monthly_totals = monthly_totals.sort_values('Month')
+                
+                # Calculate month-over-month change
+                monthly_totals['MoM Change'] = monthly_totals['Total Amount'].pct_change() * 100
+                
+                st.dataframe(
+                    monthly_totals.style.format({
+                        'Total Amount': 'Kshs {:,.2f}',
+                        'MoM Change': '{:,.1f}%'
+                    }).apply(
+                        lambda x: [''] * len(x) if x.name != len(monthly_totals)-1 
+                        else [''] + [''] + [
+                            'color: green' if val > 0 else 'color: red' if val < 0 else ''
+                            for val in x[2:]
+                        ],
+                        axis=1
+                    ),
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("No expense data available for monthly trends analysis.")
+        
+        # --- All Expenses Table ---
+        # Add a toggle to show/hide the expenses table
+        show_expenses = st.checkbox(
+            "📋 Show All Expenses",
+            value=False,
+            key='show_all_expenses',
+            help="Toggle to show/hide the detailed expenses table"
+        )
+        
+        if show_expenses:
+            st.markdown("### 📋 All Expenses")
+            
+            # Format the display dataframe
+            expenses_display = expenses_df[['Date', 'Category', 'Description', 'Amount']].copy()
+            expenses_display['Date'] = expenses_display['Date'].dt.strftime('%Y-%m-%d')
+            
+            # Add Excel export button
+            if not expenses_df.empty:
+                # Create a buffer to store the Excel file
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    # Export the actual data (not the display version)
+                    expenses_df.to_excel(writer, index=False, sheet_name='Expenses')
                     
-                    with col2:
-                        st.metric(
-                            label="Average Expense",
-                            value=f"Kshs {avg_expense:,.2f}",
-                            help="Average amount per expense"
-                        )
+                    # Get the xlsxwriter workbook and worksheet objects
+                    workbook = writer.book
+                    worksheet = writer.sheets['Expenses']
                     
-                    with col3:
-                        st.metric(
-                            label="Total Records",
-                            value=f"{expense_count:,}",
-                            help="Number of expense records"
-                        )
+                    # Add a header format
+                    header_format = workbook.add_format({
+                        'bold': True,
+                        'text_wrap': True,
+                        'valign': 'top',
+                        'fg_color': '#4CAF50',
+                        'border': 1,
+                        'font_color': 'white'
+                    })
                     
-                    # --- Expense Category Breakdown ---
-                    st.markdown("### 📈 Expense Analysis")
+                    # Write the column headers with the defined format
+                    for col_num, value in enumerate(expenses_df.columns.values):
+                        worksheet.write(0, col_num, value, header_format)
                     
-                    # Create tabs for different visualizations
+                    # Set column widths
+                    worksheet.set_column('A:A', 15)  # Date
+                    worksheet.set_column('B:B', 20)  # Category
+                    worksheet.set_column('C:C', 15)  # Subcategory if exists
+                    worksheet.set_column('D:D', 40)  # Description
+                    worksheet.set_column('E:E', 15)  # Amount
                     tab1, tab2 = st.tabs(["By Category", "Over Time"])
                     
                     with tab1:
@@ -4623,11 +5281,10 @@ def main():
                         if st.session_state.reset_expense_select:
                             st.session_state.reset_expense_select = False
                             st.rerun()
-                else:
-                    st.info("No expenses recorded yet.")
+                    else:
+                        st.info("No expenses recorded yet.")
             else:
                 st.info("No financial data available yet.")
-
         with subtab_budgets:
             if not can_edit_financials:
                 st.info("You do not have permission to manage budgets. Viewing only.")
@@ -4652,10 +5309,12 @@ def main():
                 budget_amount = st.number_input("Set Budget (Kshs):", min_value=0.0, step=100.0, format="%.2f", key='budget_amount')
                 if st.button("Save Budget", key='save_budget_btn'):
                     budgets_df = budgets_df[(budgets_df['Category'] != category) | (budgets_df['Month'] != month)]
-                    budgets_df = pd.concat([budgets_df, pd.DataFrame([{ 'Category': category, 'Month': month, 'Budget': budget_amount }])], ignore_index=True)
-                    st.session_state['budgets'] = budgets_df
-                    st.success(f"Budget for {category} ({month}) saved!")
-                    st.rerun()
+                    budgets_df = pd.concat([budgets_df, pd.DataFrame([{'Category': category, 'Month': month, 'Budget': budget_amount }])], ignore_index=True)
+                    if save_budgets_data(budgets_df):
+                        # Force refresh of budget data from CSV to ensure consistency
+                        st.session_state['budgets'] = load_budgets_data()
+                        st.success("Budget saved successfully!")
+                        st.rerun()
             with st.expander("Edit or Delete Existing Budgets"):
                 if not budgets_df.empty:
                     budgets_df = budgets_df.reset_index(drop=True)
@@ -5546,6 +6205,9 @@ def main():
                                 # Add new sale and save
                                 st.session_state['financial_data'] = pd.concat([st.session_state['financial_data'], new_sale], ignore_index=True)
                                 save_financial_data(st.session_state['financial_data'])
+                                
+                                # Force refresh of financial data from CSV to ensure consistency
+                                st.session_state['financial_data'] = load_financial_data()
                                 
                                 # Show success message
                                 st.toast('✅ Sale record added successfully!', icon='✅')

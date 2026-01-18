@@ -59,8 +59,8 @@ BUDGETS_FILE = 'budgets.csv'
 def init_supabase():
     """Initialize Supabase client"""
     try:
-        supabase_url = st.secrets["supabase"]["SUPABASE_URL"]
-        supabase_key = st.secrets["supabase"]["SUPABASE_KEY"]
+        supabase_url = st.secrets["SUPABASE_URL"]
+        supabase_key = st.secrets["SUPABASE_KEY"]
     except:
         # Fallback to environment variables for local development
         load_dotenv()

@@ -58,17 +58,23 @@ BUDGETS_FILE = 'budgets.csv'
 @st.cache_resource
 def init_supabase():
     """Initialize Supabase client"""
+    # Try Streamlit secrets first (for production)
     try:
         supabase_url = st.secrets["SUPABASE_URL"]
         supabase_key = st.secrets["SUPABASE_KEY"]
+        st.info("🔗 Using Streamlit Cloud secrets")
     except:
         # Fallback to environment variables for local development
         load_dotenv()
         supabase_url = os.getenv('SUPABASE_URL')
         supabase_key = os.getenv('SUPABASE_KEY')
+        if supabase_url and supabase_key:
+            st.info("🔧 Using local environment variables")
     
     if not supabase_url or not supabase_key:
-        st.error("❌ Supabase credentials not found. Please set SUPABASE_URL and SUPABASE_KEY in your environment variables or Streamlit secrets.")
+        st.error("❌ Supabase credentials not found.")
+        st.error("📋 For Streamlit Cloud: Add secrets in dashboard")
+        st.error("📋 For Local: Set SUPABASE_URL and SUPABASE_KEY in .env")
         return None
     
     try:

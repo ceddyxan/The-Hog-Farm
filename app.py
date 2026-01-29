@@ -674,11 +674,24 @@ def migrate_csv_to_supabase():
         st.error(f"❌ Migration failed: {str(e)}")
         return False
 
-def merge_csv_to_supabase():
+def merge_csv_to_supabase(call_reason="unknown"):
     """Merge CSV data with existing Supabase data (add only missing records)"""
     if not supabase:
         st.error("❌ Cannot merge: Supabase not connected")
         return False
+    
+    # Initialize cache for processed records if not exists
+    if 'processed_csv_records' not in st.session_state:
+        st.session_state['processed_csv_records'] = set()
+    
+    # Track merge calls to prevent excessive logging
+    if 'merge_call_count' not in st.session_state:
+        st.session_state['merge_call_count'] = 0
+    st.session_state['merge_call_count'] += 1
+    
+    # Log merge call (only first few times to avoid spam)
+    if st.session_state['merge_call_count'] <= 3:
+        print(f"🔄 Merge CSV to Supabase called (#{st.session_state['merge_call_count']}) - Reason: {call_reason}")
     
     try:
         # Get existing Supabase data
@@ -690,17 +703,17 @@ def merge_csv_to_supabase():
             if csv_df.empty:
                 return True  # Nothing to merge
             
+            # Create a more robust unique identifier for each record
+            # Normalize data to handle variations in formatting
+            def normalize_record(row):
+                date_str = str(row['Date']).strip()
+                type_str = str(row['Type']).strip().upper()
+                desc_str = str(row['Description']).strip().upper()
+                amount_str = f"{float(row['Amount']):.2f}"  # Normalize amount to 2 decimal places
+                return f"{date_str}|{type_str}|{desc_str}|{amount_str}"
+            
             # Convert Supabase data to comparable format
             if not supabase_data.empty:
-                # Create a more robust unique identifier for each record
-                # Normalize data to handle variations in formatting
-                def normalize_record(row):
-                    date_str = str(row['Date']).strip()
-                    type_str = str(row['Type']).strip().upper()
-                    desc_str = str(row['Description']).strip().upper()
-                    amount_str = f"{float(row['Amount']):.2f}"  # Normalize amount to 2 decimal places
-                    return f"{date_str}|{type_str}|{desc_str}|{amount_str}"
-                
                 supabase_data['unique_id'] = supabase_data.apply(normalize_record, axis=1)
                 existing_ids = set(supabase_data['unique_id'])
                 
@@ -714,22 +727,31 @@ def merge_csv_to_supabase():
             
             # Filter to only new records (this is the key duplicate prevention)
             new_records = csv_df[~csv_df['unique_id'].isin(existing_ids)]
+            
+            # Additional check: filter out records already processed in this session
+            if not new_records.empty:
+                new_records = new_records[~new_records['unique_id'].isin(st.session_state['processed_csv_records'])]
+            
             duplicates_found = len(csv_df) - len(new_records)
             
             if not new_records.empty:
                 # st.info(f"🔄 Found {len(new_records)} new records in CSV to add to Supabase...")  # Debug - hidden
                 if duplicates_found > 0:
                     # st.info(f"🔍 Skipped {duplicates_found} duplicate records that already exist in Supabase")  # Debug - hidden
-                
-                # Show what records are being added
+                    pass
                 for idx, row in new_records.iterrows():
                     save_financial_transaction_to_db(row.to_dict())
+                
+                # Update session cache to mark these records as processed
+                processed_ids = new_records['unique_id'].tolist()
+                st.session_state['processed_csv_records'].update(processed_ids)
                 
                 # st.success(f"✅ Successfully merged {len(new_records)} new records to Supabase!")  # Debug - hidden
             else:
                 if duplicates_found > 0:
-                    pass
+                    st.info(f"🔍 Skipped {duplicates_found} duplicate records that already exist in Supabase")
                 else:
+                    st.info("📊 No new records found in CSV to merge")
                     pass
         
         return True
@@ -900,7 +922,7 @@ def load_financial_data():
                 csv_df = pd.read_csv(FINANCIAL_DATA_FILE)
                 if not csv_df.empty:
                     # st.info("🔄 Checking for additional CSV data to merge...")  # Debug - hidden
-                    merge_csv_to_supabase()
+                    merge_csv_to_supabase("data_loading_check")
                     # Reload from Supabase to get merged data
                     db_data = load_financial_data_from_db()
                     if not db_data.empty:
@@ -914,7 +936,7 @@ def load_financial_data():
                 csv_df = pd.read_csv(FINANCIAL_DATA_FILE)
                 if not csv_df.empty:
                     # st.info("🔄 Auto-syncing CSV data to Supabase...")  # Debug - hidden
-                    if merge_csv_to_supabase():
+                    if merge_csv_to_supabase("auto_sync"):
                         st.success("✅ Data automatically synced to Supabase!")
                         # Try loading from Supabase again after sync
                         db_data = load_financial_data_from_db()
@@ -1761,7 +1783,7 @@ def main():
         # Force immediate merge on refresh if Supabase is connected
         if supabase and os.path.exists(FINANCIAL_DATA_FILE):
             # st.info("🔄 Auto-merging data on page refresh...")  # Debug - hidden
-            merge_csv_to_supabase()
+            merge_csv_to_supabase("page_refresh")
             # Reload data after merge to get the latest combined dataset
             st.session_state['financial_data'] = load_financial_data()
             # st.success("✅ Data merge completed on refresh!")  # Debug - hidden

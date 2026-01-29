@@ -1,1 +1,4 @@
-Date,Type,Category,Description,Hog ID,Weight (kg),Price/kg,Amount,Buyer,Subcategory
+Date,Type,Category,Description,Amount,Buyer,Subcategory,Hog ID,Weight (kg),Price/kg
+2026-01-22,Expense,Labor,Labor costs,4300,,,,,
+2026-01-22,Expense,Utilities,Utility bills,2100,,,,,
+2026-01-22,Expense,Feed,Animal feed,700,,,,,

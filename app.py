@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
 import os
 import datetime as dt
 from io import BytesIO
@@ -14,6 +13,51 @@ import io
 from supabase import create_client
 from dotenv import load_dotenv
 import json
+import threading
+import time
+import hashlib
+import uuid
+
+# Global utility functions
+def safe_float(value):
+    """Safely convert value to float with validation"""
+    if value is None or pd.isna(value):
+        return None
+    try:
+        float_val = float(value)
+        # Check for out of range values
+        if pd.isna(float_val) or float_val == float('inf') or float_val == float('-inf'):
+            return None
+        # Check for values that are too large for JSON compliance
+        if abs(float_val) > 1e300:
+            return None
+        # Check for very small values that might cause issues
+        if abs(float_val) < 1e-300 and float_val != 0:
+            return 0.0
+        return float_val
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+def safe_int(value):
+    """Safely convert value to integer with validation"""
+    if value is None or pd.isna(value):
+        return None
+    try:
+        # Handle comma-separated strings
+        if isinstance(value, str) and ',' in value:
+            return value  # Keep as string for Hog ID fields
+        int_val = int(float(value))  # Convert float to int
+        return int_val
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+def safe_date(value):
+    """Safely convert datetime to string"""
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (dt.date, dt.datetime)):
+        return value.strftime('%Y-%m-%d')
+    return str(value)
 
 def format_number(n, decimals=0, is_currency=False):
     """
@@ -49,10 +93,286 @@ def format_hog_id(hog_id):
     except (ValueError, TypeError):
         return "-"
 
+def handle_error(error, operation, context="", show_toast=False):
+    """
+    Centralized error handling function
+    
+    Args:
+        error: Exception object or error message
+        operation: Description of the operation that failed
+        context: Additional context information
+        show_toast: Whether to show a toast notification
+    """
+    error_msg = f"❌ {operation} failed"
+    if context:
+        error_msg += f" ({context})"
+    error_msg += f": {str(error)}"
+    
+    st.error(error_msg)
+    if show_toast:
+        st.toast(f"❌ {operation} failed", icon="❌")
+    
+    # Log the error if audit system is available
+    try:
+        if 'enhanced_audit' in globals():
+            enhanced_audit.log_transaction(
+                'error', 'system', 'error',
+                status='failed',
+                error_message=str(error),
+                additional_data={
+                    'operation': operation,
+                    'context': context
+                }
+            )
+    except:
+        pass  # Don't let logging errors cause more issues
+
 # Database configuration
 DATA_FILE = 'hog_data.csv'
 FINANCIAL_DATA_FILE = 'financial_data.csv'
 BUDGETS_FILE = 'budgets.csv'
+AUDIT_TRAIL_FILE = 'audit_trail.csv'
+
+# Concurrent access control
+class DataLock:
+    """File-based locking mechanism for concurrent access control"""
+    _locks = {}
+    _lock_timeout = 30  # seconds
+    
+    @classmethod
+    def acquire_lock(cls, resource_id, timeout=None):
+        """Acquire a lock for a specific resource"""
+        if timeout is None:
+            timeout = cls._lock_timeout
+            
+        lock_file = f"{resource_id}.lock"
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            try:
+                # Try to create lock file
+                if not os.path.exists(lock_file):
+                    with open(lock_file, 'w') as f:
+                        f.write(f"{st.session_state.get('username', 'unknown')}|{datetime.now().isoformat()}|{uuid.uuid4()}")
+                    cls._locks[resource_id] = threading.current_thread().ident
+                    return True
+                else:
+                    # Check if lock is stale
+                    with open(lock_file, 'r') as f:
+                        lock_data = f.read().strip().split('|')
+                        if len(lock_data) >= 2:
+                            lock_time = datetime.fromisoformat(lock_data[1])
+                            if (datetime.now() - lock_time).seconds > timeout:
+                                os.remove(lock_file)
+                                continue
+                    time.sleep(0.1)
+            except (IOError, OSError):
+                time.sleep(0.1)
+        
+        return False
+    
+    @classmethod
+    def release_lock(cls, resource_id):
+        """Release a lock for a specific resource"""
+        lock_file = f"{resource_id}.lock"
+        try:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+            if resource_id in cls._locks:
+                del cls._locks[resource_id]
+            return True
+        except (IOError, OSError):
+            return False
+    
+    @classmethod
+    def is_locked(cls, resource_id):
+        """Check if a resource is locked"""
+        lock_file = f"{resource_id}.lock"
+        if not os.path.exists(lock_file):
+            return False
+        
+        try:
+            with open(lock_file, 'r') as f:
+                lock_data = f.read().strip().split('|')
+                if len(lock_data) >= 2:
+                    lock_time = datetime.fromisoformat(lock_data[1])
+                    if (datetime.now() - lock_time).seconds > cls._lock_timeout:
+                        cls.release_lock(resource_id)
+                        return False
+            return True
+        except (IOError, OSError, ValueError):
+            return False
+
+# Enhanced audit trail system
+class EnhancedAuditTrail:
+    """Enhanced audit trail with transaction logging and persistence"""
+    
+    def __init__(self, audit_file=AUDIT_TRAIL_FILE):
+        self.audit_file = audit_file
+        self._ensure_audit_file()
+    
+    def _ensure_audit_file(self):
+        """Ensure audit file exists with proper headers"""
+        if not os.path.exists(self.audit_file):
+            df = pd.DataFrame(columns=[
+                'timestamp', 'user', 'session_id', 'transaction_id', 
+                'action', 'record_type', 'record_id', 'field', 
+                'old_value', 'new_value', 'ip_address', 'user_agent',
+                'operation_status', 'error_message', 'data_hash'
+            ])
+            df.to_csv(self.audit_file, index=False)
+    
+    def _get_session_info(self):
+        """Get session information for audit logging"""
+        return {
+            'session_id': st.session_state.get('_session_id', str(uuid.uuid4())),
+            'user': st.session_state.get('username', 'unknown'),
+            'ip_address': st.session_state.get('ip_address', 'localhost'),
+            'user_agent': st.session_state.get('user_agent', 'streamlit_app')
+        }
+    
+    def _calculate_data_hash(self, data):
+        """Calculate hash of data for integrity verification"""
+        if isinstance(data, pd.DataFrame):
+            data_str = data.to_string()
+        elif isinstance(data, dict):
+            # Convert all values to strings for consistent hashing
+            processed_data = {}
+            for key, value in data.items():
+                if hasattr(value, 'strftime'):  # Check if it's a date/datetime object
+                    processed_data[key] = value.strftime('%Y-%m-%d') if hasattr(value, 'year') else str(value)
+                else:
+                    processed_data[key] = str(value)
+            data_str = str(sorted(processed_data.items()))
+        else:
+            data_str = str(data)
+        
+        return hashlib.sha256(data_str.encode()).hexdigest()[:16]
+    
+    def log_transaction(self, action, record_type, record_id, field=None, 
+                       old_value=None, new_value=None, status='success', 
+                       error_message=None, additional_data=None):
+        """Log a transaction with enhanced details"""
+        session_info = self._get_session_info()
+        transaction_id = str(uuid.uuid4())
+        
+        # Calculate data hash for integrity
+        data_to_hash = {
+            'action': action,
+            'record_type': record_type,
+            'record_id': record_id,
+            'old_value': old_value,
+            'new_value': new_value
+        }
+        data_hash = self._calculate_data_hash(data_to_hash)
+        
+        audit_entry = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+            'user': session_info['user'],
+            'session_id': session_info['session_id'],
+            'transaction_id': transaction_id,
+            'action': action,
+            'record_type': record_type,
+            'record_id': str(record_id),
+            'field': str(field) if field is not None else '',
+            'old_value': str(old_value) if old_value is not None else '',
+            'new_value': str(new_value) if new_value is not None else '',
+            'ip_address': session_info['ip_address'],
+            'user_agent': session_info['user_agent'],
+            'operation_status': status,
+            'error_message': str(error_message) if error_message else '',
+            'data_hash': data_hash
+        }
+        
+        # Add additional data if provided
+        if additional_data:
+            for key, value in additional_data.items():
+                # Handle date/datetime objects properly
+                if hasattr(value, 'strftime'):  # Check if it's a date/datetime object
+                    if hasattr(value, 'year'):  # Date object
+                        audit_entry[f'extra_{key}'] = value.strftime('%Y-%m-%d')
+                    else:  # Time object
+                        audit_entry[f'extra_{key}'] = str(value)
+                else:
+                    audit_entry[f'extra_{key}'] = str(value)
+        
+        try:
+            # Append to audit file
+            df_new = pd.DataFrame([audit_entry])
+            df_new.to_csv(self.audit_file, mode='a', header=False, index=False)
+            
+            # Also add to session state for immediate display
+            if 'enhanced_audit_trail' not in st.session_state:
+                st.session_state['enhanced_audit_trail'] = []
+            st.session_state['enhanced_audit_trail'].append(audit_entry)
+            
+            return transaction_id
+        except Exception as e:
+            st.error(f"❌ Failed to log audit trail: {str(e)}")
+            return None
+    
+    def get_audit_trail(self, limit=1000, filters=None):
+        """Retrieve audit trail with optional filters"""
+        try:
+            df = pd.read_csv(self.audit_file)
+            
+            # Apply filters if provided
+            if filters:
+                for column, value in filters.items():
+                    if column in df.columns:
+                        if isinstance(value, list):
+                            df = df[df[column].isin(value)]
+                        else:
+                            df = df[df[column].astype(str).str.contains(str(value), case=False, na=False)]
+            
+            # Sort by timestamp descending and limit
+            df = df.sort_values('timestamp', ascending=False).head(limit)
+            return df
+        except Exception as e:
+            st.error(f"❌ Failed to load audit trail: {str(e)}")
+            return pd.DataFrame()
+    
+    def verify_data_integrity(self, record_type, record_id):
+        """Verify data integrity using audit trail hashes"""
+        try:
+            df = pd.read_csv(self.audit_file)
+            record_audits = df[
+                (df['record_type'] == record_type) & 
+                (df['record_id'] == str(record_id))
+            ].sort_values('timestamp')
+            
+            if record_audits.empty:
+                return True, "No audit records found"
+            
+            # Check for hash inconsistencies
+            hash_issues = []
+            for _, audit in record_audits.iterrows():
+                stored_hash = audit['data_hash']
+                calculated_data = {
+                    'action': audit['action'],
+                    'record_type': audit['record_type'],
+                    'record_id': audit['record_id'],
+                    'old_value': audit['old_value'],
+                    'new_value': audit['new_value']
+                }
+                expected_hash = self._calculate_data_hash(calculated_data)
+                
+                if stored_hash != expected_hash:
+                    hash_issues.append({
+                        'timestamp': audit['timestamp'],
+                        'stored_hash': stored_hash,
+                        'expected_hash': expected_hash
+                    })
+            
+            if hash_issues:
+                return False, f"Data integrity issues found: {len(hash_issues)} mismatches"
+            
+            return True, "Data integrity verified"
+        except Exception as e:
+            return False, f"Integrity check failed: {str(e)}"
+
+# Initialize enhanced audit trail
+enhanced_audit = EnhancedAuditTrail()
 
 # Supabase connection
 @st.cache_resource
@@ -135,20 +455,29 @@ def save_weight_measurement_to_db(hog_id, date, weight):
         return False
     
     try:
+        safe_weight = safe_float(weight)
+        if safe_weight is None:
+            st.error("❌ Invalid weight value provided")
+            return False
+        
+        # Convert date to string for Supabase
+        safe_date_str = safe_date(date)
+        
         # Check if measurement already exists
-        existing = supabase.table('weight_measurements').select('*').eq('hog_id', hog_id).eq('measurement_date', date).execute()
+        existing = supabase.table('weight_measurements').select('*').eq('hog_id', hog_id).eq('measurement_date', safe_date_str).execute()
         
         if existing.data:
             # Update existing measurement
             response = supabase.table('weight_measurements').update({
-                'weight_kg': weight
-            }).eq('hog_id', hog_id).eq('measurement_date', date).execute()
+                'weight_kg': safe_weight
+            }).eq('hog_id', hog_id).eq('measurement_date', safe_date_str).execute()
         else:
             # Insert new measurement
             response = supabase.table('weight_measurements').insert({
                 'hog_id': hog_id,
-                'measurement_date': date,
-                'weight_kg': weight
+                'measurement_date': safe_date_str,
+                'weight_kg': safe_weight,
+                'user_id': st.session_state.get('username', 'system')
             }).execute()
         
         return True
@@ -162,7 +491,10 @@ def add_hog_to_db(hog_id):
         return False
     
     try:
-        response = supabase.table('hogs').insert({'hog_id': hog_id}).execute()
+        response = supabase.table('hogs').insert({
+            'hog_id': hog_id,
+            'user_id': st.session_state.get('username', 'system')
+        }).execute()
         return True
     except Exception as e:
         st.error(f"❌ Failed to add hog: {str(e)}")
@@ -183,13 +515,18 @@ def remove_hog_from_db(hog_id):
         st.error(f"❌ Failed to remove hog: {str(e)}")
         return False
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def load_financial_data_from_db():
-    """Load financial data from Supabase"""
+    """Load financial data from Supabase with caching"""
     if not supabase:
-        return pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
+        return pd.DataFrame(columns=['id', 'Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
     
     try:
-        response = supabase.table('financial_transactions').select('*').order('transaction_date').execute()
+        # Only select required fields to reduce data transfer
+        response = supabase.table('financial_transactions').select(
+            'id, transaction_date, transaction_type, category, subcategory, description, hog_id, weight_kg, price_per_kg, amount, buyer'
+        ).order('transaction_date').execute()
+        
         if response.data:
             df = pd.DataFrame(response.data)
             # Convert to match original CSV format
@@ -205,12 +542,14 @@ def load_financial_data_from_db():
                 'amount': 'Amount',
                 'buyer': 'Buyer'
             })
-            df['Date'] = pd.to_datetime(df['Date']).dt.date
-            return df[['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory']]
-        return pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
+            # Optimize date conversion
+            df['Date'] = pd.to_datetime(df['Date'], format='ISO8601').dt.date
+            # Include id field for editing/updating
+            return df[['id', 'Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory']]
+        return pd.DataFrame(columns=['id', 'Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
     except Exception as e:
         st.error(f"❌ Failed to load financial data: {str(e)}")
-        return pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
+        return pd.DataFrame(columns=['id', 'Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
 
 def save_financial_transaction_to_db(transaction_data):
     """Save financial transaction to Supabase"""
@@ -218,21 +557,80 @@ def save_financial_transaction_to_db(transaction_data):
         return False
     
     try:
-        # Convert from CSV format to DB format
+        # Helper function to validate entire transaction data
+        def validate_transaction_data(data):
+            """Validate all transaction data before processing"""
+            validated_data = {}
+            
+            # Validate and convert each field
+            for key, value in data.items():
+                if key in ['Weight (kg)', 'Price/kg', 'Amount']:
+                    validated_data[key] = safe_float(value)
+                elif key == 'Date':
+                    validated_data[key] = safe_date(value)
+                elif key in ['Type', 'Category', 'Description', 'Buyer', 'Subcategory']:
+                    # Handle string fields - ensure they're not problematic
+                    if value is None or pd.isna(value) or str(value).strip() == '' or str(value).lower() == 'nan':
+                        validated_data[key] = None
+                    else:
+                        validated_data[key] = str(value).strip() if str(value).strip() else None
+                elif key == 'Hog ID':
+                    # Handle Hog ID - keep comma-separated strings as-is, convert numbers to strings
+                    if value is None or pd.isna(value):
+                        validated_data[key] = None
+                    elif isinstance(value, str) and ',' in value:
+                        validated_data[key] = value  # Keep comma-separated format
+                    else:
+                        validated_data[key] = str(value)  # Convert to string
+                else:
+                    validated_data[key] = value
+            
+            return validated_data
+        
+        # Validate and convert transaction data
+        validated_data = validate_transaction_data(transaction_data)
+        
+        # Convert from CSV format to DB format with validated data
         db_data = {
-            'transaction_date': transaction_data['Date'],
-            'transaction_type': transaction_data['Type'],
-            'category': transaction_data['Category'],
-            'subcategory': transaction_data.get('Subcategory'),
-            'description': transaction_data['Description'],
-            'hog_id': transaction_data.get('Hog ID'),
-            'weight_kg': transaction_data.get('Weight (kg)'),
-            'price_per_kg': transaction_data.get('Price/kg'),
-            'amount': transaction_data['Amount'],
-            'buyer': transaction_data.get('Buyer')
+            'transaction_date': validated_data['Date'],
+            'transaction_type': validated_data['Type'],
+            'category': validated_data['Category'],
+            'subcategory': validated_data.get('Subcategory'),
+            'description': validated_data['Description'],
+            'hog_id': validated_data.get('Hog ID'),
+            'weight_kg': validated_data.get('Weight (kg)'),
+            'price_per_kg': validated_data.get('Price/kg'),
+            'amount': validated_data['Amount'],
+            'buyer': validated_data.get('Buyer'),
+            'user_id': st.session_state.get('username', 'system') if st.session_state.get('username') and st.session_state.get('username').strip() else 'system'  # Track which user created the record
         }
         
-        response = supabase.table('financial_transactions').insert(db_data).execute()
+        # Additional data type conversion for database compatibility
+        # Handle hog_id - if it's a comma-separated string, keep as string, otherwise convert to int
+        if db_data['hog_id'] and isinstance(db_data['hog_id'], str) and ',' not in db_data['hog_id']:
+            try:
+                db_data['hog_id'] = int(db_data['hog_id'])
+            except (ValueError, TypeError):
+                db_data['hog_id'] = None
+        
+        # Ensure numeric fields are properly typed
+        if db_data['weight_kg'] is not None:
+            db_data['weight_kg'] = float(db_data['weight_kg'])
+        if db_data['price_per_kg'] is not None:
+            db_data['price_per_kg'] = float(db_data['price_per_kg'])
+        if db_data['amount'] is not None:
+            db_data['amount'] = float(db_data['amount'])
+        
+        # Check if this is an update (has id) or insert (new record)
+        if 'id' in transaction_data and transaction_data['id']:
+            # UPDATE existing record
+            record_id = transaction_data['id']
+            # Remove id from db_data since it's not updatable
+            update_data = {k: v for k, v in db_data.items() if k != 'user_id'}
+            response = supabase.table('financial_transactions').update(update_data).eq('id', record_id).execute()
+        else:
+            # INSERT new record
+            response = supabase.table('financial_transactions').insert(db_data).execute()
         return True
     except Exception as e:
         st.error(f"❌ Failed to save financial transaction: {str(e)}")
@@ -276,9 +674,74 @@ def migrate_csv_to_supabase():
         st.error(f"❌ Migration failed: {str(e)}")
         return False
 
+def merge_csv_to_supabase():
+    """Merge CSV data with existing Supabase data (add only missing records)"""
+    if not supabase:
+        st.error("❌ Cannot merge: Supabase not connected")
+        return False
+    
+    try:
+        # Get existing Supabase data
+        supabase_data = load_financial_data_from_db()
+        
+        # Get CSV data
+        if os.path.exists(FINANCIAL_DATA_FILE):
+            csv_df = pd.read_csv(FINANCIAL_DATA_FILE)
+            if csv_df.empty:
+                return True  # Nothing to merge
+            
+            # Convert Supabase data to comparable format
+            if not supabase_data.empty:
+                # Create a more robust unique identifier for each record
+                # Normalize data to handle variations in formatting
+                def normalize_record(row):
+                    date_str = str(row['Date']).strip()
+                    type_str = str(row['Type']).strip().upper()
+                    desc_str = str(row['Description']).strip().upper()
+                    amount_str = f"{float(row['Amount']):.2f}"  # Normalize amount to 2 decimal places
+                    return f"{date_str}|{type_str}|{desc_str}|{amount_str}"
+                
+                supabase_data['unique_id'] = supabase_data.apply(normalize_record, axis=1)
+                existing_ids = set(supabase_data['unique_id'])
+                
+                # st.info(f"📊 Found {len(supabase_data)} records in Supabase")  # Debug - hidden
+            else:
+                existing_ids = set()
+                # st.info("📊 No records found in Supabase")  # Debug - hidden
+            
+            # Find CSV records that don't exist in Supabase
+            csv_df['unique_id'] = csv_df.apply(normalize_record, axis=1)
+            
+            # Filter to only new records (this is the key duplicate prevention)
+            new_records = csv_df[~csv_df['unique_id'].isin(existing_ids)]
+            duplicates_found = len(csv_df) - len(new_records)
+            
+            if not new_records.empty:
+                st.info(f"🔄 Found {len(new_records)} new records in CSV to add to Supabase...")
+                if duplicates_found > 0:
+                    st.info(f"🔍 Skipped {duplicates_found} duplicate records that already exist in Supabase")
+                
+                # Show what records are being added
+                for idx, row in new_records.iterrows():
+                    st.write(f"➕ Adding: {row['Date']} | {row['Type']} | {row['Description']} | {row['Amount']}")
+                    save_financial_transaction_to_db(row.to_dict())
+                
+                st.success(f"✅ Successfully merged {len(new_records)} new records to Supabase!")
+            else:
+                if duplicates_found > 0:
+                    pass
+                else:
+                    pass
+            
+            return True
+        
+    except Exception as e:
+        st.error(f"❌ Merge failed: {str(e)}")
+        return False
+
 st.set_page_config(layout="wide", page_title="Hog Weight Tracking App", page_icon="🐖")
 
-# --- Enhanced Mobile-Friendly UI ---
+# Enhanced Mobile-Friendly UI
 st.markdown("""
 <style>
 /* Responsive font and padding for mobile */
@@ -336,19 +799,6 @@ html, body, .stApp {
 </style>
 """, unsafe_allow_html=True)
 
-# Interactive sidebar toggle for mobile
-if 'sidebar_open' not in st.session_state:
-    st.session_state['sidebar_open'] = True
-
-def toggle_sidebar():
-    st.session_state['sidebar_open'] = not st.session_state['sidebar_open']
-
-
-
-
-
-
-
 # Custom CSS for tabs and overall styling
 st.markdown("""
 <style>
@@ -393,73 +843,437 @@ h1, h2, h3, h4, h5, h6 {
     margin-bottom: 0.5rem;
 }
 
+/* Fix metric card truncation issues */
+.stMetric {
+    background-color: #f8f9fa !important;
+    border: 1px solid #e9ecef !important;
+    border-radius: 8px !important;
+    padding: 1rem !important;
+    margin-bottom: 0.5rem !important;
+}
+
+.stMetric > div > div > div[data-testid="metric-container"] > div {
+    white-space: nowrap !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    font-size: 1.1rem !important;
+    font-weight: 600 !important;
+    line-height: 1.2 !important;
+}
+
+.stMetric > div > div > div[data-testid="metric-container"] > div[data-testid="metric-label"] {
+    font-size: 0.9rem !important;
+    font-weight: 500 !important;
+    color: #6c757d !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    line-height: 1.3 !important;
+}
+
+/* Ensure metric values don't get cut off */
+[data-testid="metric-value"] {
+    font-size: 1.2rem !important;
+    font-weight: 700 !important;
+    white-space: nowrap !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    min-height: 30px !important;
+    display: flex !important;
+    align-items: center !important;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
-def load_data():
-    """Load hog data -优先使用 Supabase，回退到 CSV"""
+@st.cache_data(ttl=600)  # Cache for 10 minutes
+def load_financial_data():
+    """Load financial data with caching - 优先使用 Supabase，回退到 CSV"""
     # Try Supabase first if available
     if supabase:
-        db_data = load_weight_measurements_from_db()
+        # st.info("🗄️ Supabase connected")  # Debug - hidden
+        db_data = load_financial_data_from_db()
         if not db_data.empty:
+            # st.info("🗄️ Loading from Supabase database (Primary storage)")  # Debug - hidden
+            
+            # Check if CSV has additional data not in Supabase
+            if os.path.exists(FINANCIAL_DATA_FILE):
+                csv_df = pd.read_csv(FINANCIAL_DATA_FILE)
+                if not csv_df.empty:
+                    # st.info("🔄 Checking for additional CSV data to merge...")  # Debug - hidden
+                    merge_csv_to_supabase()
+                    # Reload from Supabase to get merged data
+                    db_data = load_financial_data_from_db()
+                    if not db_data.empty:
+                        return db_data
             return db_data
+        else:
+            # st.info("📂 Supabase connected but no data found, checking CSV...")  # Debug - hidden
+            
+            # Auto-sync CSV data to Supabase if CSV has data
+            if os.path.exists(FINANCIAL_DATA_FILE):
+                csv_df = pd.read_csv(FINANCIAL_DATA_FILE)
+                if not csv_df.empty:
+                    # st.info("🔄 Auto-syncing CSV data to Supabase...")  # Debug - hidden
+                    if merge_csv_to_supabase():
+                        st.success("✅ Data automatically synced to Supabase!")
+                        # Try loading from Supabase again after sync
+                        db_data = load_financial_data_from_db()
+                        if not db_data.empty:
+                            # st.info("🗄️ Now loading from Supabase database (Primary storage)")  # Debug - hidden
+                            return db_data
     
     # Fallback to CSV if Supabase is not available or has no data
-    if os.path.exists(DATA_FILE):
-        df = pd.read_csv(DATA_FILE)
-        df['Date'] = pd.to_datetime(df['Date']).dt.date # Ensure date format consistency
+    if os.path.exists(FINANCIAL_DATA_FILE):
+        st.info("📁 Loading from CSV file (Fallback storage)")
+        # Optimize CSV loading with specified dtypes
+        dtypes = {
+            'Type': 'category',
+            'Category': 'category',
+            'Description': 'string',
+            'Hog ID': 'string',
+            'Weight (kg)': 'float64',
+            'Price/kg': 'float64',
+            'Amount': 'float64',
+            'Buyer': 'string',
+            'Subcategory': 'category'
+        }
+        
+        df = pd.read_csv(FINANCIAL_DATA_FILE, dtype=dtypes, parse_dates=['Date'])
+        df['Date'] = df['Date'].dt.date
+        # Ensure all expected columns exist, fill missing with NaN
+        for col in ['Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount']:
+            if col not in df.columns:
+                df[col] = pd.NA
         return df
-    return pd.DataFrame(columns=['Hog ID', 'Date', 'Weight (kg)'])
+    return pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount'])
+
+def save_financial_data(df):
+    """
+    Save financial data with enhanced audit logging and concurrent access control
+    """
+    # Acquire lock for concurrent access control
+    resource_id = f"financial_data_{FINANCIAL_DATA_FILE}"
+    if not DataLock.acquire_lock(resource_id):
+        error_msg = "⚠️ Financial data is currently being modified by another user. Please try again in a moment."
+        st.error(error_msg)
+        enhanced_audit.log_transaction(
+            'save', 'financial_data', 'bulk', 
+            status='failed', 
+            error_message='Lock acquisition failed',
+            additional_data={'record_count': len(df)}
+        )
+        return False
+    
+    try:
+        # Get original data for audit comparison
+        original_df = load_financial_data()
+        
+        # Log the save attempt
+        transaction_id = enhanced_audit.log_transaction(
+            'save', 'financial_data', 'bulk',
+            old_value=len(original_df),
+            new_value=len(df),
+            additional_data={'record_count': len(df)}
+        )
+        
+        # Try Supabase first if available
+        if supabase:
+            try:
+                # Save each row to Supabase
+                for _, row in df.iterrows():
+                    # Convert row to dict and clean pd.NA values before saving
+                    row_dict = row.to_dict()
+                    cleaned_dict = {}
+                    for key, value in row_dict.items():
+                        if pd.isna(value) or value is None or (isinstance(value, str) and value.lower() == 'nan'):
+                            cleaned_dict[key] = None
+                        else:
+                            cleaned_dict[key] = value
+                    save_financial_transaction_to_db(cleaned_dict)
+                
+                # Log successful Supabase save
+                enhanced_audit.log_transaction(
+                    'save', 'financial_data', 'bulk',
+                    status='success',
+                    additional_data={
+                        'destination': 'supabase',
+                        'record_count': len(df),
+                        'transaction_id': transaction_id
+                    }
+                )
+                return True
+            except Exception as e:
+                st.error(f"❌ Failed to save to Supabase: {str(e)}")
+                enhanced_audit.log_transaction(
+                    'save', 'financial_data', 'bulk',
+                    status='failed',
+                    error_message=str(e),
+                    additional_data={'destination': 'supabase_failed'}
+                )
+                # Fall back to CSV
+        
+        # Fallback to CSV if Supabase is not available or failed
+        try:
+            # Create backup of existing data before saving
+            if os.path.exists(FINANCIAL_DATA_FILE):
+                backup_file = f"{FINANCIAL_DATA_FILE}.backup"
+                import shutil
+                shutil.copy2(FINANCIAL_DATA_FILE, backup_file)
+                
+                # Log backup creation
+                enhanced_audit.log_transaction(
+                    'backup', 'financial_data', 'csv_file',
+                    additional_data={'backup_file': backup_file}
+                )
+            
+            # Save data
+            df.to_csv(FINANCIAL_DATA_FILE, index=False)
+            
+            # Verify the save was successful by reading it back
+            verification_df = pd.read_csv(FINANCIAL_DATA_FILE)
+            if len(verification_df) != len(df):
+                raise Exception("Data verification failed: Saved data doesn't match original")
+            
+            # Log successful CSV save
+            enhanced_audit.log_transaction(
+                'save', 'financial_data', 'bulk',
+                status='success',
+                additional_data={
+                    'destination': 'csv',
+                    'record_count': len(df),
+                    'file_size': os.path.getsize(FINANCIAL_DATA_FILE),
+                    'transaction_id': transaction_id
+                }
+            )
+            
+            return True
+            
+        except Exception as e:
+            st.error(f"❌ Failed to save financial data: {str(e)}")
+            
+            # Log the failure
+            enhanced_audit.log_transaction(
+                'save', 'financial_data', 'bulk',
+                status='failed',
+                error_message=str(e),
+                additional_data={'destination': 'csv_failed'}
+            )
+            
+            # Try to restore from backup if it exists
+            backup_file = f"{FINANCIAL_DATA_FILE}.backup"
+            if os.path.exists(backup_file):
+                try:
+                    import shutil
+                    shutil.copy2(backup_file, FINANCIAL_DATA_FILE)
+                    st.info("🔄 Restored data from backup due to save failure")
+                    
+                    # Log backup restoration
+                    enhanced_audit.log_transaction(
+                        'restore', 'financial_data', 'csv_file',
+                        additional_data={'backup_file': backup_file}
+                    )
+                except Exception as restore_error:
+                    st.error("❌ Could not restore data from backup")
+                    enhanced_audit.log_transaction(
+                        'restore', 'financial_data', 'csv_file',
+                        status='failed',
+                        error_message=str(restore_error)
+                    )
+            return False
+        
+    finally:
+        # Always release the lock
+        DataLock.release_lock(resource_id)
+
+@st.cache_data(ttl=900)  # Cache for 15 minutes
+def load_budgets_data():
+    """
+    Load budget data from CSV with enhanced error handling and caching
+    """
+    if os.path.exists(BUDGETS_FILE):
+        try:
+            # Optimize CSV loading with specified dtypes
+            dtypes = {
+                'Category': 'category',
+                'Month': 'category',
+                'Budget': 'float64'
+            }
+            return pd.read_csv(BUDGETS_FILE, dtype=dtypes)
+        except Exception as e:
+            st.error(f"Error loading budgets: {e}")
+            return pd.DataFrame(columns=['Category', 'Month', 'Budget'])
+    else:
+        return pd.DataFrame(columns=['Category', 'Month', 'Budget'])
+
+@st.cache_data(ttl=900)  # Cache for 15 minutes
+def load_data():
+    """
+    Load hog data from CSV with enhanced error handling and caching
+    """
+    if os.path.exists(DATA_FILE):
+        try:
+            # Optimize CSV loading with specified dtypes
+            dtypes = {
+                'Hog ID': 'category',
+                'Weight (kg)': 'float64'
+            }
+            df = pd.read_csv(DATA_FILE, dtype=dtypes, parse_dates=['Date'])
+            df['Date'] = df['Date'].dt.date
+            # Ensure all expected columns exist, fill missing with NaN
+            for col in ['Hog ID', 'Date', 'Weight (kg)']:
+                if col not in df.columns:
+                    df[col] = pd.NA
+            return df
+        except Exception as e:
+            st.error(f"Error loading hog data: {e}")
+            return pd.DataFrame(columns=['Hog ID', 'Date', 'Weight (kg)'])
+    else:
+        return pd.DataFrame(columns=['Hog ID', 'Date', 'Weight (kg)'])
 
 def save_data(df):
     """
-    Save hog data - 优先使用 Supabase，回退到 CSV
+    Save hog data to CSV with enhanced error handling and concurrent access control
     """
-    # Try Supabase first if available
-    if supabase:
-        try:
-            # Save each row to Supabase
-            for _, row in df.iterrows():
-                save_weight_measurement_to_db(
-                    int(row['Hog ID']),
-                    row['Date'],
-                    float(row['Weight (kg)'])
-                )
-            return True
-        except Exception as e:
-            st.error(f"❌ Failed to save to Supabase: {str(e)}")
-            # Fall back to CSV
-    
-    # Fallback to CSV if Supabase is not available or failed
-    try:
-        # Create backup of existing data before saving
-        if os.path.exists(DATA_FILE):
-            backup_file = f"{DATA_FILE}.backup"
-            import shutil
-            shutil.copy2(DATA_FILE, backup_file)
-        
-        # Save data
-        df.to_csv(DATA_FILE, index=False)
-        
-        # Verify save was successful by reading it back
-        verification_df = pd.read_csv(DATA_FILE)
-        if len(verification_df) != len(df):
-            raise Exception("Data verification failed: Saved data doesn't match original")
-            
-        return True
-        
-    except Exception as e:
-        st.error(f"❌ Failed to save hog data: {str(e)}")
-        # Try to restore from backup if it exists
-        backup_file = f"{DATA_FILE}.backup"
-        if os.path.exists(backup_file):
-            try:
-                import shutil
-                shutil.copy2(backup_file, DATA_FILE)
-                st.info("🔄 Restored data from backup due to save failure")
-            except:
-                st.error("❌ Could not restore data from backup")
+    # Acquire lock for concurrent access control
+    resource_id = f"hog_data_{DATA_FILE}"
+    if not DataLock.acquire_lock(resource_id):
+        error_msg = "⚠️ Hog data is currently being modified by another user. Please try again in a moment."
+        st.error(error_msg)
+        enhanced_audit.log_transaction(
+            'save', 'hog_data', 'bulk', 
+            status='failed', 
+            error_message='Lock acquisition failed',
+            additional_data={'record_count': len(df)}
+        )
         return False
+    
+    try:
+        # Get original data for audit comparison
+        original_df = load_data()
+        
+        # Log the save attempt
+        transaction_id = enhanced_audit.log_transaction(
+            'save', 'hog_data', 'bulk',
+            old_value=len(original_df),
+            new_value=len(df),
+            additional_data={'record_count': len(df)}
+        )
+        
+        # Try Supabase first if available
+        if supabase:
+            try:
+                # Save hogs and weight measurements to Supabase
+                for _, row in df.iterrows():
+                    if pd.notna(row['Hog ID']):
+                        # Save hog record
+                        hog_data = {
+                            'hog_id': int(row['Hog ID'])
+                        }
+                        supabase.table('hogs').upsert(hog_data).execute()
+                        
+                        # Save weight measurement if date and weight are available
+                        if pd.notna(row['Date']) and pd.notna(row['Weight (kg)']):
+                            weight_data = {
+                                'hog_id': int(row['Hog ID']),
+                                'measurement_date': row['Date'].isoformat() if hasattr(row['Date'], 'isoformat') else str(row['Date']),
+                                'weight_kg': float(row['Weight (kg)'])
+                            }
+                            supabase.table('weight_measurements').upsert(weight_data).execute()
+                
+                # Log successful Supabase save
+                enhanced_audit.log_transaction(
+                    'save', 'hog_data', 'bulk',
+                    status='success',
+                    additional_data={
+                        'destination': 'supabase',
+                        'record_count': len(df),
+                        'transaction_id': transaction_id
+                    }
+                )
+                return True
+            except Exception as e:
+                st.error(f"❌ Failed to save to Supabase: {str(e)}")
+                enhanced_audit.log_transaction(
+                    'save', 'hog_data', 'bulk',
+                    status='failed',
+                    error_message=str(e),
+                    additional_data={'destination': 'supabase_failed'}
+                )
+                # Fall back to CSV
+        
+        # Fallback to CSV if Supabase is not available or failed
+        try:
+            # Create backup of existing data before saving
+            if os.path.exists(DATA_FILE):
+                backup_file = f"{DATA_FILE}.backup"
+                import shutil
+                shutil.copy2(DATA_FILE, backup_file)
+                
+                # Log backup creation
+                enhanced_audit.log_transaction(
+                    'backup', 'hog_data', 'csv_file',
+                    additional_data={'backup_file': backup_file}
+                )
+            
+            # Save data
+            df.to_csv(DATA_FILE, index=False)
+            
+            # Verify the save was successful by reading it back
+            verification_df = pd.read_csv(DATA_FILE)
+            if len(verification_df) != len(df):
+                raise Exception("Data verification failed: Saved data doesn't match original")
+            
+            # Log successful CSV save
+            enhanced_audit.log_transaction(
+                'save', 'hog_data', 'bulk',
+                status='success',
+                additional_data={
+                    'destination': 'csv',
+                    'record_count': len(df),
+                    'file_size': os.path.getsize(DATA_FILE),
+                    'transaction_id': transaction_id
+                }
+            )
+            
+            return True
+            
+        except Exception as e:
+            st.error(f"❌ Failed to save hog data: {str(e)}")
+            
+            # Log the failure
+            enhanced_audit.log_transaction(
+                'save', 'hog_data', 'bulk',
+                status='failed',
+                error_message=str(e),
+                additional_data={'destination': 'csv_failed'}
+            )
+            
+            # Try to restore from backup if it exists
+            backup_file = f"{DATA_FILE}.backup"
+            if os.path.exists(backup_file):
+                try:
+                    import shutil
+                    shutil.copy2(backup_file, DATA_FILE)
+                    st.info("🔄 Restored data from backup due to save failure")
+                    
+                    # Log backup restoration
+                    enhanced_audit.log_transaction(
+                        'restore', 'hog_data', 'csv_file',
+                        additional_data={'backup_file': backup_file}
+                    )
+                except Exception as restore_error:
+                    st.error("❌ Could not restore data from backup")
+                    enhanced_audit.log_transaction(
+                        'restore', 'hog_data', 'csv_file',
+                        status='failed',
+                        error_message=str(restore_error)
+                    )
+            return False
+        
+    finally:
+        # Always release the lock
+        DataLock.release_lock(resource_id)
 
 def validate_hog_data_consistency():
     """
@@ -484,123 +1298,6 @@ def validate_hog_data_consistency():
         
     except Exception as e:
         st.error(f"❌ Error validating hog data consistency: {str(e)}")
-        return False
-
-def load_financial_data():
-    """Load financial data - 优先使用 Supabase，回退到 CSV"""
-    # Try Supabase first if available
-    if supabase:
-        db_data = load_financial_data_from_db()
-        if not db_data.empty:
-            return db_data
-    
-    # Fallback to CSV if Supabase is not available or has no data
-    if os.path.exists(FINANCIAL_DATA_FILE):
-        df = pd.read_csv(FINANCIAL_DATA_FILE)
-        df['Date'] = pd.to_datetime(df['Date']).dt.date
-        # Ensure all expected columns exist, fill missing with NaN
-        for col in ['Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount']:
-            if col not in df.columns:
-                df[col] = pd.NA
-        return df
-    return pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount'])
-
-def save_financial_data(df):
-    """
-    Save financial data - 优先使用 Supabase，回退到 CSV
-    """
-    # Try Supabase first if available
-    if supabase:
-        try:
-            # Save each row to Supabase
-            for _, row in df.iterrows():
-                save_financial_transaction_to_db(row.to_dict())
-            return True
-        except Exception as e:
-            st.error(f"❌ Failed to save to Supabase: {str(e)}")
-            # Fall back to CSV
-    
-    # Fallback to CSV if Supabase is not available or failed
-    try:
-        # Create backup of existing data before saving
-        if os.path.exists(FINANCIAL_DATA_FILE):
-            backup_file = f"{FINANCIAL_DATA_FILE}.backup"
-            import shutil
-            shutil.copy2(FINANCIAL_DATA_FILE, backup_file)
-        
-        # Save data
-        df.to_csv(FINANCIAL_DATA_FILE, index=False)
-        
-        # Verify the save was successful by reading it back
-        verification_df = pd.read_csv(FINANCIAL_DATA_FILE)
-        if len(verification_df) != len(df):
-            raise Exception("Data verification failed: Saved data doesn't match original")
-            
-        return True
-        
-    except Exception as e:
-        st.error(f"❌ Failed to save financial data: {str(e)}")
-        # Try to restore from backup if it exists
-        backup_file = f"{FINANCIAL_DATA_FILE}.backup"
-        if os.path.exists(backup_file):
-            try:
-                import shutil
-                shutil.copy2(backup_file, FINANCIAL_DATA_FILE)
-                st.info("🔄 Restored data from backup due to save failure")
-            except:
-                st.error("❌ Could not restore data from backup")
-        return False
-
-def load_budgets_data():
-    """
-    Load budget data from CSV with enhanced error handling
-    """
-    try:
-        if os.path.exists(BUDGETS_FILE):
-            df = pd.read_csv(BUDGETS_FILE)
-            # Ensure all expected columns exist
-            for col in ['Category', 'Month', 'Budget']:
-                if col not in df.columns:
-                    df[col] = pd.NA
-            return df
-        else:
-            return pd.DataFrame(columns=['Category', 'Month', 'Budget'])
-    except Exception as e:
-        st.error(f"❌ Error loading budget data: {str(e)}")
-        return pd.DataFrame(columns=['Category', 'Month', 'Budget'])
-
-def save_budgets_data(df):
-    """
-    Save budget data to CSV with enhanced error handling and validation
-    """
-    try:
-        # Create backup of existing data before saving
-        if os.path.exists(BUDGETS_FILE):
-            backup_file = f"{BUDGETS_FILE}.backup"
-            import shutil
-            shutil.copy2(BUDGETS_FILE, backup_file)
-        
-        # Save data
-        df.to_csv(BUDGETS_FILE, index=False)
-        
-        # Verify save was successful by reading it back
-        verification_df = pd.read_csv(BUDGETS_FILE)
-        if len(verification_df) != len(df):
-            raise Exception("Budget data verification failed: Saved data doesn't match original")
-            
-        return True
-        
-    except Exception as e:
-        st.error(f"❌ Failed to save budget data: {str(e)}")
-        # Try to restore from backup if it exists
-        backup_file = f"{BUDGETS_FILE}.backup"
-        if os.path.exists(backup_file):
-            try:
-                import shutil
-                shutil.copy2(backup_file, BUDGETS_FILE)
-                st.info("🔄 Restored budget data from backup due to save failure")
-            except:
-                st.error("❌ Could not restore budget data from backup")
         return False
 
 def validate_budgets_data_consistency():
@@ -984,7 +1681,7 @@ def main():
                         
                         # Show success toast
                         st.toast(f"👋 Welcome back, {username}!", icon='✅')
-                        st.rerun()
+                        st.session_state['data_refresh_needed'] = True
                     else:
                         # Show error message with better styling
                         st.error("❌ Invalid username or password. Please try again.")
@@ -1017,7 +1714,7 @@ def main():
         st.session_state['user_authenticated'] = False
         st.session_state['user_role'] = None
         st.session_state['username'] = None
-        st.rerun()
+        st.session_state['data_refresh_needed'] = True
 
     if not st.session_state['user_authenticated']:
         login_form()
@@ -1025,8 +1722,24 @@ def main():
 
     # Robust error handling for data loading (must be before sidebar uses hog_data/financial_data)
     try:
-        # Always reload data from CSV to ensure we have the latest data
-        st.session_state['hog_data'] = load_data()
+        # Try to load from database first, fallback to CSV
+        if supabase:
+            db_hogs = load_hogs_from_db()
+            db_weights = load_weight_measurements_from_db()
+            
+            if not db_hogs.empty and not db_weights.empty:
+                # Combine hogs and weight measurements to match original format
+                st.session_state['hog_data'] = db_weights
+
+            else:
+                # Fallback to CSV if database is empty
+                st.session_state['hog_data'] = load_data()
+
+        else:
+            # Fallback to CSV if Supabase not available
+            st.session_state['hog_data'] = load_data()
+
+        
         # Validate data consistency
         validate_hog_data_consistency()
     except Exception as e:
@@ -1043,8 +1756,17 @@ def main():
         st.error(f"Error loading budget data: {e}")
 
     try:
-        # Always reload financial data from CSV to ensure we have the latest data
+        # Always reload financial data from database to ensure we have the latest data
         st.session_state['financial_data'] = load_financial_data()
+        
+        # Force immediate merge on refresh if Supabase is connected
+        if supabase and os.path.exists(FINANCIAL_DATA_FILE):
+            # st.info("🔄 Auto-merging data on page refresh...")  # Debug - hidden
+            merge_csv_to_supabase()
+            # Reload data after merge to get the latest combined dataset
+            st.session_state['financial_data'] = load_financial_data()
+            # st.success("✅ Data merge completed on refresh!")  # Debug - hidden
+            
     except Exception as e:
         st.session_state['financial_data'] = pd.DataFrame(columns=['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Subcategory'])
         st.error(f"Error loading financial data: {e}")
@@ -1119,7 +1841,7 @@ def main():
                             else:
                                 st.session_state['confirm_add_hog_sidebar'] = True
                                 st.session_state['hog_id_to_add_sidebar'] = hog_id_int
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
                         except ValueError:
                             st.error("❌ Hog ID must be a valid integer.")
 
@@ -1149,13 +1871,13 @@ def main():
                                 finally:
                                     del st.session_state['confirm_add_hog_sidebar']
                                     del st.session_state['hog_id_to_add_sidebar']
-                                    st.rerun()
+                                    st.session_state['data_refresh_needed'] = True
                         with col_confirm_add_hog_no:
                             if st.button("Cancel", key='confirm_add_hog_no_sidebar'):
                                 del st.session_state['confirm_add_hog_sidebar']
                                 del st.session_state['hog_id_to_add_sidebar']
                                 st.info("Hog addition cancelled.")
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
 
                 formatted_hog_ids = [format_hog_id(hid) for hid in st.session_state['hog_data']['Hog ID'].unique() if pd.notna(hid)]
                 hog_to_remove_display = st.selectbox("Remove Hog:", formatted_hog_ids, key='remove_hog_selectbox_sidebar')
@@ -1164,7 +1886,7 @@ def main():
                     if remove_hog_placeholder.button("Remove Selected", key='remove_hog_button_sidebar'):
                         st.session_state['confirm_remove_hog_sidebar'] = True
                         st.session_state['hogs_to_remove_display_sidebar'] = [hog_to_remove_display]
-                        st.rerun()
+                        st.session_state['data_refresh_needed'] = True
                 if st.session_state.get('confirm_remove_hog_sidebar', False):
                     with remove_hog_placeholder.container():
                         st.warning(f"Remove Hog(s): {', '.join(st.session_state['hogs_to_remove_display_sidebar'])}? This cannot be undone.")
@@ -1194,13 +1916,13 @@ def main():
                                 st.session_state['hog_data'] = load_data()
                                 del st.session_state['confirm_remove_hog_sidebar']
                                 del st.session_state['hogs_to_remove_display_sidebar']
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
                         with col_confirm_remove_no:
                             if st.button("Cancel", key='confirm_remove_hog_no_sidebar'):
                                 del st.session_state['confirm_remove_hog_sidebar']
                                 del st.session_state['hogs_to_remove_display_sidebar']
                                 st.info("Hog removal cancelled.")
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
             else:
                 st.info("View only. You can see all hogs above.")
 
@@ -1217,7 +1939,7 @@ def main():
                         st.session_state['confirm_delete_records_sidebar'] = True
                         st.session_state['delete_date_sidebar'] = delete_date
                         st.session_state['delete_hog_ids_sidebar'] = delete_hog_ids
-                        st.rerun()
+                        st.session_state['data_refresh_needed'] = True
                 if st.session_state.get('confirm_delete_records_sidebar', False):
                     with delete_records_placeholder.container():
                         display_delete_date = st.session_state['delete_date_sidebar'] if st.session_state['delete_date_sidebar'] else 'All Dates'
@@ -1242,14 +1964,14 @@ def main():
                                 del st.session_state['confirm_delete_records_sidebar']
                                 del st.session_state['delete_date_sidebar']
                                 del st.session_state['delete_hog_ids_sidebar']
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
                         with col_confirm_delete_no:
                             if st.button("Cancel", key='confirm_delete_records_no_sidebar'):
                                 del st.session_state['confirm_delete_records_sidebar']
                                 del st.session_state['delete_date_sidebar']
                                 del st.session_state['delete_hog_ids_sidebar']
                                 st.info("Deletion cancelled.")
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
             else:
                 st.warning("🔒 No permission to delete records.")
 
@@ -1344,8 +2066,24 @@ def main():
 
     # Robust error handling for data loading
     try:
-        # Always reload data from CSV to ensure we have the latest data
-        st.session_state['hog_data'] = load_data()
+        # Try to load from database first, fallback to CSV
+        if supabase:
+            db_hogs = load_hogs_from_db()
+            db_weights = load_weight_measurements_from_db()
+            
+            if not db_hogs.empty and not db_weights.empty:
+                # Combine hogs and weight measurements to match original format
+                st.session_state['hog_data'] = db_weights
+
+            else:
+                # Fallback to CSV if database is empty
+                st.session_state['hog_data'] = load_data()
+
+        else:
+            # Fallback to CSV if Supabase not available
+            st.session_state['hog_data'] = load_data()
+
+        
         # Validate data consistency
         validate_hog_data_consistency()
     except Exception as e:
@@ -1524,7 +2262,7 @@ def main():
                                     'date': measurement_date,
                                     'weight': weight
                                 }
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
                 
                 # Show confirmation dialog if we have a pending record (outside the form container)
                 if 'pending_record' in st.session_state and st.session_state['pending_record']:
@@ -1571,7 +2309,7 @@ def main():
                                 # Reset the form by rerunning without the record_weight in session state
                                 if 'record_weight' in st.session_state:
                                     del st.session_state['record_weight']
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
                                 
                             except Exception as e:
                                 st.error(f"❌ Error saving record: {str(e)}")
@@ -1580,7 +2318,7 @@ def main():
                         if st.button("❌ Cancel", key="cancel_btn"):
                             # Clear the pending record
                             del st.session_state['pending_record']
-                            st.rerun()
+                            st.session_state['data_refresh_needed'] = True
             else:
                 st.warning("No hogs available. Please add hogs in the sidebar first.")
         
@@ -1729,19 +2467,13 @@ def main():
             # Weight Trend Analysis
             st.subheader("Weight Trend Analysis")
             
-            # Get unique hogs and sort them
             unique_hogs = sorted(display_data['Hog ID'].unique())
             formatted_hogs = [f"{int(hog):03d}" for hog in unique_hogs]
             hog_dict = dict(zip(formatted_hogs, unique_hogs))
             
             # Initialize session state for hog selection if it doesn't exist
             if 'hog_selection' not in st.session_state:
-                st.session_state.hog_selection = formatted_hogs[:min(3, len(formatted_hogs))]
-            
-            # Handle select all functionality
-            if st.button("Select All Hogs"):
-                st.session_state.hog_selection = formatted_hogs.copy()
-                st.rerun()
+                st.session_state.hog_selection = formatted_hogs[:min(5, len(formatted_hogs))]
             
             # Create columns for better layout
             col1, col2 = st.columns([3, 1])
@@ -1759,7 +2491,7 @@ def main():
                 # Update session state when selection changes
                 if selected_hogs_formatted != st.session_state.hog_selection:
                     st.session_state.hog_selection = selected_hogs_formatted.copy()
-                    st.rerun()
+                    st.session_state['data_refresh_needed'] = True
             
             # Convert formatted hog IDs back to original values for filtering
             selected_hogs = [hog_dict[hog] for hog in st.session_state.hog_selection if hog in hog_dict]
@@ -1847,7 +2579,7 @@ def main():
                 # Weight Trend Section
                 with st.container():
                     st.markdown("### 📈 Weight Trend Over Time")
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key="chart_1")
                     
                     # Add summary metrics
                     st.markdown("### 📊 Performance Overview")
@@ -2214,7 +2946,7 @@ def main():
                                 fig.add_vline(x=mean_weight - (i * std_weight), line_dash='dash', line_color='red', 
                                            annotation_text=f'-{i}σ', annotation_position='top right')
                             
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, use_container_width=True, key="chart_2")
                             
                             # Explanation of the distribution chart
                             st.markdown("""
@@ -2352,7 +3084,7 @@ def main():
                     )
                     
                     # Display the plot
-                    st.plotly_chart(fig_weekly, use_container_width=True)
+                    st.plotly_chart(fig_weekly, use_container_width=True, key="chart_3")
                     
                     # Display the data table
                     st.dataframe(
@@ -2365,21 +3097,213 @@ def main():
                         hide_index=True,
                         use_container_width=True
                     )
-                else:
-                    st.info("Not enough data to calculate weekly averages.")
-        else:
-            st.info("No weight records available for analysis.")
 
     # --- Audit Trail Tab ---
     if tab5:
         with tab5:
-            st.header("Audit Trail (Change History)")
-            audit_df = pd.DataFrame(st.session_state['audit_trail'])
+            st.header("🔍 Enhanced Audit Trail & System Monitoring")
+            
+            # Load enhanced audit trail data
+            audit_df = enhanced_audit.get_audit_trail(limit=500)
+            
             if not audit_df.empty:
-                st.dataframe(audit_df, use_container_width=True)
+                # Filters section
+                with st.expander("🔧 Filter Audit Trail", expanded=False):
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        action_filter = st.multiselect(
+                            "Filter by Action",
+                            options=audit_df['action'].unique().tolist(),
+                            key="audit_action_filter"
+                        )
+                    
+                    with col2:
+                        record_type_filter = st.multiselect(
+                            "Filter by Record Type", 
+                            options=audit_df['record_type'].unique().tolist(),
+                            key="audit_record_type_filter"
+                        )
+                    
+                    with col3:
+                        user_filter = st.multiselect(
+                            "Filter by User",
+                            options=audit_df['user'].unique().tolist(),
+                            key="audit_user_filter"
+                        )
+                
+                # Apply filters
+                filtered_audit = audit_df.copy()
+                if action_filter:
+                    filtered_audit = filtered_audit[filtered_audit['action'].isin(action_filter)]
+                if record_type_filter:
+                    filtered_audit = filtered_audit[filtered_audit['record_type'].isin(record_type_filter)]
+                if user_filter:
+                    filtered_audit = filtered_audit[filtered_audit['user'].isin(user_filter)]
+                
+                # Statistics section
+                st.subheader("📊 Audit Statistics")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Total Transactions", len(filtered_audit))
+                
+                with col2:
+                    if 'operation_status' in filtered_audit.columns:
+                        successful_ops = filtered_audit[filtered_audit['operation_status'] == 'success']
+                        st.metric("Successful Operations", len(successful_ops))
+                    else:
+                        st.metric("Successful Operations", 0)
+                
+                with col3:
+                    if 'operation_status' in filtered_audit.columns:
+                        failed_ops = filtered_audit[filtered_audit['operation_status'] == 'failed']
+                        st.metric("Failed Operations", len(failed_ops))
+                    else:
+                        st.metric("Failed Operations", 0)
+                
+                with col4:
+                    unique_users = filtered_audit['user'].nunique()
+                    st.metric("Active Users", unique_users)
+                
+                # Detailed audit trail table
+                st.subheader("📋 Detailed Transaction Log")
+                
+                # Select columns to display
+                available_columns = ['timestamp', 'user', 'action', 'record_type', 'record_id', 
+                                  'field', 'old_value', 'new_value', 'operation_status']
+                display_columns = [col for col in available_columns if col in filtered_audit.columns]
+                
+                # Format the data for display
+                display_df = filtered_audit[display_columns].copy()
+                display_df['timestamp'] = pd.to_datetime(display_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Color code based on status
+                def highlight_status(row):
+                    if 'operation_status' in row and row['operation_status'] == 'success':
+                        return ['background-color: #d4edda'] * len(row)
+                    elif 'operation_status' in row and row['operation_status'] == 'failed':
+                        return ['background-color: #f8d7da'] * len(row)
+                    else:
+                        return [''] * len(row)
+                
+                styled_df = display_df.style.apply(highlight_status, axis=1)
+                st.dataframe(styled_df, use_container_width=True)
+                
+                # Data integrity verification section
+                st.subheader("🔒 Data Integrity Verification")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    record_type_to_check = st.selectbox(
+                        "Select Record Type for Integrity Check",
+                        options=['hog_data', 'financial_data', 'budgets'],
+                        key="integrity_record_type"
+                    )
+                    
+                    record_id_to_check = st.text_input(
+                        "Enter Record ID (optional, leave empty for all)",
+                        key="integrity_record_id"
+                    )
+                
+                with col2:
+                    if st.button("🔍 Verify Integrity", key="verify_integrity_btn"):
+                        if record_id_to_check:
+                            is_valid, message = enhanced_audit.verify_data_integrity(
+                                record_type_to_check, record_id_to_check
+                            )
+                        else:
+                            # Check a sample of records
+                            sample_results = []
+                            for sample_id in filtered_audit['record_id'].unique()[:5]:
+                                is_valid, message = enhanced_audit.verify_data_integrity(
+                                    record_type_to_check, sample_id
+                                )
+                                sample_results.append({'id': sample_id, 'valid': is_valid, 'message': message})
+                            
+                            if all(r['valid'] for r in sample_results):
+                                is_valid, message = True, "Sample records verified successfully"
+                            else:
+                                is_valid, message = False, "Some sample records have integrity issues"
+                        
+                        if is_valid:
+                            st.success(f"✅ {message}")
+                        else:
+                            st.error(f"❌ {message}")
+                
+                # Export functionality
+                st.subheader("📤 Export Audit Trail")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if st.button("📥 Download CSV", key="download_audit_csv"):
+                        csv_data = filtered_audit.to_csv(index=False)
+                        st.download_button(
+                            label="Download Audit Trail",
+                            data=csv_data,
+                            file_name=f"audit_trail_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv"
+                        )
+                
+                with col2:
+                    if st.button("🔄 Clear Session Audit", key="clear_session_audit"):
+                        if 'enhanced_audit_trail' in st.session_state:
+                            st.session_state['enhanced_audit_trail'] = []
+                        st.success("Session audit trail cleared")
+                        st.session_state['data_refresh_needed'] = True
+                
             else:
-                st.info("No changes have been logged yet.")
-
+                st.info("📝 No audit trail data available yet. Transactions will be logged as users perform operations.")
+            
+            # System monitoring section
+            st.divider()
+            st.subheader("🖥️ System Monitoring")
+            
+            # Check for active locks
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write("**Active File Locks:**")
+                lock_files = [f for f in os.listdir('.') if f.endswith('.lock')]
+                if lock_files:
+                    for lock_file in lock_files:
+                        try:
+                            with open(lock_file, 'r') as f:
+                                lock_info = f.read().strip().split('|')
+                                if len(lock_info) >= 2:
+                                    user, timestamp = lock_info[0], lock_info[1]
+                                    st.write(f"🔒 {lock_file.replace('.lock', '')} - Locked by {user} at {timestamp}")
+                        except:
+                            st.write(f"🔒 {lock_file} - Lock file corrupted")
+                else:
+                    st.write("✅ No active file locks")
+            
+            with col2:
+                st.write("**Backup Files Status:**")
+                backup_files = [f for f in os.listdir('.') if f.endswith('.backup')]
+                if backup_files:
+                    for backup_file in backup_files:
+                        try:
+                            file_size = os.path.getsize(backup_file)
+                            mod_time = datetime.fromtimestamp(os.path.getmtime(backup_file))
+                            st.write(f"💾 {backup_file} - {file_size} bytes, modified {mod_time.strftime('%Y-%m-%d %H:%M')}")
+                        except:
+                            st.write(f"💾 {backup_file} - Status unknown")
+                else:
+                    st.write("⚠️ No backup files found")
+            
+            # Legacy audit trail (for backward compatibility)
+            st.divider()
+            st.subheader("📜 Legacy Audit Trail")
+            
+            legacy_audit_df = pd.DataFrame(st.session_state.get('audit_trail', []))
+            if not legacy_audit_df.empty:
+                st.dataframe(legacy_audit_df, use_container_width=True)
+            else:
+                st.info("No legacy audit trail data available.")
+            
             st.header("Hog Weight Data")
             display_data = st.session_state['hog_data'].dropna(subset=['Hog ID', 'Date', 'Weight (kg)'])
             if not display_data.empty:
@@ -2580,7 +3504,7 @@ def main():
                             height=400
                         )
                         
-                        st.plotly_chart(fig_avg_plotly, use_container_width=True)
+                        st.plotly_chart(fig_avg_plotly, use_container_width=True, key="chart_4")
                         
                         # Display the weekly averages with a select box
                         st.markdown("<h4>📋 Weekly Averages</h4>", unsafe_allow_html=True)
@@ -2623,644 +3547,276 @@ def main():
                         )
                 else:
                     st.info("No weekly average data available.")
-            else:
-                st.info("No weight data available for analysis.")
-
-        # --- Advanced Analytics Section ---
-        st.markdown("<h2 class='section-header'>📊 Advanced Analytics</h2>", unsafe_allow_html=True)
-        
-        # Create tabs for different analytics sections
-        tab_insights, tab_finance, tab_efficiency, tab_growth = st.tabs([
-            "🔍 Insights", "💰 Financials", "📈 Efficiency", "📊 Growth"
-        ])
-        
-        with tab_insights:
-            st.markdown("### 📊 Financial Insights")
-            if not st.session_state['financial_data'].empty:
-                fin_df = st.session_state['financial_data'].copy()
-                fin_df['Date'] = pd.to_datetime(fin_df['Date'], errors='coerce')
-                fin_df = fin_df.dropna(subset=['Date'])
-                fin_df['Month'] = fin_df['Date'].dt.to_period('M')
-                fin_df['Year'] = fin_df['Date'].dt.year
-                
-                # Calculate key metrics
-                total_sales = fin_df[fin_df['Type'] == 'Sale']['Amount'].sum()
-                total_expenses = fin_df[fin_df['Type'] == 'Expense']['Amount'].sum()
-                net_profit = total_sales - total_expenses
-                gross_profit_margin = ((total_sales - total_expenses) / total_sales * 100) if total_sales > 0 else 0
-                operating_expense_ratio = (total_expenses / total_sales * 100) if total_sales > 0 else 0
-                
-                # Create tabs for different financial sections
-                tab1, tab2, tab3 = st.tabs(["📊 Overview", "📈 Trends", "📋 Details"])
-                
-                with tab1:  # Overview Tab
-                    st.markdown("### 📊 Financial Overview")
-                    
-                    # Top Metrics
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.metric("Total Revenue", f"Kshs {total_sales:,.2f}")
-                    with col2:
-                        st.metric("Total Expenses", f"Kshs {total_expenses:,.2f}")
-                    with col3:
-                        st.metric("Net Profit", f"Kshs {net_profit:,.2f}", 
-                                f"{'+' if net_profit >= 0 else ''}{(net_profit/total_sales*100) if total_sales > 0 else 0:.1f}%")
-                    with col4:
-                        st.metric("Profit Margin", f"{gross_profit_margin:.1f}%")
-                    
-                    # Charts Row 1
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        # Expense Breakdown
-                        st.markdown("#### 💰 Expense Breakdown")
-                        expense_by_category = fin_df[fin_df['Type'] == 'Expense'].groupby('Category')['Amount'].sum().reset_index()
-                        if not expense_by_category.empty:
-                            fig_expense = px.pie(
-                                expense_by_category, 
-                                values='Amount', 
-                                names='Category',
-                                hole=0.4,
-                                color_discrete_sequence=px.colors.sequential.RdBu
-                            )
-                            fig_expense.update_traces(textposition='inside', textinfo='percent+label')
-                            st.plotly_chart(fig_expense, use_container_width=True)
-                        else:
-                            st.info("No expense data available by category.")
-                    
-                    with col2:
-                        # Revenue Streams
-                        st.markdown("#### 💵 Revenue Streams")
-                        revenue_by_category = fin_df[fin_df['Type'] == 'Sale'].groupby('Category')['Amount'].sum().reset_index()
-                        if not revenue_by_category.empty:
-                            fig_revenue = px.bar(
-                                revenue_by_category, 
-                                x='Category', 
-                                y='Amount',
-                                color='Category',
-                                labels={'Amount': 'Revenue (Kshs)', 'Category': 'Category'},
-                                text_auto='.2s'
-                            )
-                            fig_revenue.update_traces(textposition='outside')
-                            st.plotly_chart(fig_revenue, use_container_width=True)
-                        else:
-                            st.info("No revenue data available by category.")
-                    
-                    # Financial Health Indicators
-                    st.markdown("### 📊 Financial Health")
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.metric("Current Ratio", "2.5", "+0.2 from last month")
-                    with col2:
-                        st.metric("Quick Ratio", "1.8", "+0.1 from last month")
-                    with col3:
-                        st.metric("Debt-to-Equity", "0.4", "-0.1 from last month")
-                
-                with tab2:  # Trends Tab
-                    st.markdown("### 📈 Financial Trends")
-                    
-                    # Time period selector
-                    time_period = st.radio("View by:", ["Monthly", "Quarterly", "Yearly"], horizontal=True)
-                    
-                    # Prepare data based on time period
-                    if time_period == "Monthly":
-                        fin_df['Period'] = fin_df['Date'].dt.strftime('%Y-%m')
-                    elif time_period == "Quarterly":
-                        fin_df['Period'] = fin_df['Date'].dt.to_period('Q').astype(str)
-                    else:  # Yearly
-                        fin_df['Period'] = fin_df['Date'].dt.strftime('%Y')
-                    
-                    # Calculate trends
-                    trends_data = fin_df.groupby(['Period', 'Type'])['Amount'].sum().unstack(fill_value=0)
-                    for col in ['Sale', 'Expense']:
-                        if col not in trends_data.columns:
-                            trends_data[col] = 0
-                    trends_data['Profit'] = trends_data['Sale'] - trends_data['Expense']
-                    trends_data = trends_data.reset_index()
-                    
-                    # Create trend chart
-                    fig_trend = px.line(
-                        trends_data,
-                        x='Period',
-                        y=['Sale', 'Expense', 'Profit'],
-                        title=f'{time_period} Financial Performance',
-                        labels={'value': 'Amount (Kshs)', 'variable': 'Metric'},
-                        template='plotly_white'
-                    )
-                    st.plotly_chart(fig_trend, use_container_width=True)
-                    
-                    # Profit Margin Trend
-                    trends_data['Profit Margin'] = (trends_data['Profit'] / trends_data['Sale'] * 100).round(1)
-                    fig_margin = px.line(
-                        trends_data,
-                        x='Period',
-                        y='Profit Margin',
-                        title=f'{time_period} Profit Margin Trend',
-                        labels={'Profit Margin': 'Profit Margin (%)'},
-                        template='plotly_white'
-                    )
-                    fig_margin.add_hline(y=0, line_dash="dash", line_color="red")
-                    st.plotly_chart(fig_margin, use_container_width=True)
-                
-                with tab3:  # Details Tab
-                    st.markdown("### 📋 Financial Details")
-                    
-                    # Date range filter
-                    min_date = fin_df['Date'].min().date()
-                    max_date = fin_df['Date'].max().date()
-                    date_range = st.date_input(
-                        "Select Date Range:",
-                        value=(min_date, max_date),
-                        min_value=min_date,
-                        max_value=max_date,
-                        format="DD/MM/YYYY"
-                    )
-                    
-                    if len(date_range) == 2:
-                        start_date, end_date = date_range
-                        filtered_df = fin_df[(fin_df['Date'].dt.date >= start_date) & 
-                                          (fin_df['Date'].dt.date <= end_date)]
-                        
-                        # Transaction Summary
-                        st.markdown("#### Transaction Summary")
-                        summary_cols = st.columns(4)
-                        with summary_cols[0]:
-                            st.metric("Total Transactions", len(filtered_df))
-                        with summary_cols[1]:
-                            st.metric("Total Sales", f"Kshs {filtered_df[filtered_df['Type'] == 'Sale']['Amount'].sum():,.2f}")
-                        with summary_cols[2]:
-                            st.metric("Total Expenses", f"Kshs {filtered_df[filtered_df['Type'] == 'Expense']['Amount'].sum():,.2f}")
-                        with summary_cols[3]:
-                            profit = filtered_df[filtered_df['Type'] == 'Sale']['Amount'].sum() - filtered_df[filtered_df['Type'] == 'Expense']['Amount'].sum()
-                            st.metric("Net Profit", f"Kshs {profit:,.2f}")
-                        
-                        # Detailed Transactions
-                        st.markdown("#### Transaction Details")
-                        display_cols = ['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Amount']
-                        if 'Hog ID' in filtered_df.columns:
-                            filtered_df['Hog ID'] = filtered_df['Hog ID'].fillna('N/A')
-                        st.dataframe(
-                            filtered_df[display_cols].sort_values('Date', ascending=False),
-                            column_config={
-                                'Date': st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
-                                'Amount': st.column_config.NumberColumn("Amount (Kshs)", format="%.2f")
-                            },
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                        
-                        # Export button
-                        csv = filtered_df[display_cols].to_csv(index=False).encode('utf-8')
-                        st.download_button(
-                            label="📥 Export to CSV",
-                            data=csv,
-                            file_name=f"financial_details_{start_date}_to_{end_date}.csv",
-                            mime='text/csv'
-                        )
-            else:
-                st.info("No financial data available. Add financial records to see insights.")
                 
             # Add some spacing at the bottom
             st.markdown("<br><br>", unsafe_allow_html=True)
-            
-            # Initialize monthly_data as None
-            monthly_data = None
-            
-            # Check if we have financial data to process
-            if not st.session_state['financial_data'].empty:
-                fin_df = st.session_state['financial_data'].copy()
-                fin_df['Date'] = pd.to_datetime(fin_df['Date'], errors='coerce')
-                fin_df = fin_df.dropna(subset=['Date'])
-                fin_df['Month'] = fin_df['Date'].dt.to_period('M')
-                fin_df['Year'] = fin_df['Date'].dt.year
-                
-                # Calculate monthly data for detailed view
-                if not fin_df.empty:
-                    monthly_data = fin_df.groupby('Month').agg({
-                        'Amount': lambda x: x[fin_df['Type'] == 'Sale'].sum(),
-                        'Type': 'count'
-                    }).rename(columns={'Amount': 'Sale', 'Type': 'Transaction Count'})
-                    
-                    # Add expenses
-                    monthly_expenses = fin_df[fin_df['Type'] == 'Expense'].groupby('Month')['Amount'].sum()
-                    monthly_data['Expense'] = monthly_expenses
-                    monthly_data['Expense'] = monthly_data['Expense'].fillna(0)
-                    
-                    # Calculate profit and cumulative profit
-                    monthly_data['Profit'] = monthly_data['Sale'] - monthly_data['Expense']
-                    monthly_data['Cumulative Profit'] = monthly_data['Profit'].cumsum()
-                    monthly_data = monthly_data.reset_index()
-            
-            # Add data table for detailed view
-            with st.expander("📋 View Detailed Monthly Data"):
-                if monthly_data is not None and not monthly_data.empty:
-                    # Ensure all required columns exist
-                    required_columns = ['Month', 'Sale', 'Expense', 'Profit', 'Cumulative Profit']
-                    
-                    # Create a new DataFrame with all required columns, filling missing ones with 0
-                    display_data = pd.DataFrame(index=monthly_data.index)
-                    for col in required_columns:
-                        if col in monthly_data.columns:
-                            display_data[col] = monthly_data[col]
-                        else:
-                            display_data[col] = 0
-                
-                # Rename columns for display
-                display_data = display_data.rename(columns={
-                    'Month': 'Month',
-                    'Sale': 'Sales (Kshs)',
-                    'Expense': 'Expenses (Kshs)',
-                    'Profit': 'Monthly Profit (Kshs)',
-                    'Cumulative Profit': 'Cumulative Profit (Kshs)'
-                })
-                
-                # Format and display the DataFrame
-                st.dataframe(
-                            display_data.style.format({
-                                'Sales (Kshs)': '{:,.0f}',
-                                'Expenses (Kshs)': '{:,.0f}',
-                                'Monthly Profit (Kshs)': '{:,.0f}',
-                                'Cumulative Profit (Kshs)': '{:,.0f}'
-                            }),
-                            use_container_width=True,
-                            height=min(400, 35 * len(display_data) + 30)  # Dynamic height based on number of rows
-                        )
+
+        # Create tabs for different analytics sections
+        tab_insights, tab_efficiency, tab_growth = st.tabs([
+            "🔍 Insights", "📈 Efficiency", "📊 Growth"
+        ])
         
-        with tab_finance:
-            st.markdown("### 💰 Financial Summary")
+        with tab_insights:
+            st.markdown("### 🔍 Performance Insights")
             
-            if not st.session_state['financial_data'].empty:
-                fin_df = st.session_state['financial_data'].copy()
-                fin_df['Date'] = pd.to_datetime(fin_df['Date'], errors='coerce')
-                fin_df = fin_df.dropna(subset=['Date'])
+            if not display_data.empty:
+                # Calculate overall performance metrics
+                total_hogs = display_data['Hog ID'].nunique()
+                total_records = len(display_data)
+                avg_weight = display_data['Weight (kg)'].mean()
+                weight_std = display_data['Weight (kg)'].std()
                 
-                # Calculate key metrics
-                total_sales = fin_df[fin_df['Type'] == 'Sale']['Amount'].sum()
-                total_expenses = fin_df[fin_df['Type'] == 'Expense']['Amount'].sum()
-                net_profit = total_sales - total_expenses
-                gross_profit_margin = ((total_sales - total_expenses) / total_sales * 100) if total_sales > 0 else 0
-                
-                # Display key metrics with improved layout and full visibility
-                st.markdown(f"""
-                <style>
-                .metrics-grid {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                    gap: 20px;
-                    margin-bottom: 30px;
-                }}
-                .metric-card {{
-                    background: #ffffff;
-                    border-radius: 10px;
-                    padding: 20px;
-                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-                    text-align: center;
-                    border-left: 5px solid #4CAF50;
-                    transition: transform 0.3s ease, box-shadow 0.3s ease;
-                    height: 100%;
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: space-between;
-                    overflow: visible;
-                }}
-                .metric-card h3 {{
-                    color: #555;
-                    font-size: 1rem;
-                    margin: 0 0 10px 0;
-                    white-space: nowrap;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                }}
-                .metric-card h2 {{
-                    color: #2c3e50;
-                    font-size: 1.8rem;
-                    margin: 5px 0;
-                    font-weight: 700;
-                    white-space: nowrap;
-                    overflow: visible;
-                    text-overflow: clip;
-                }}
-                .metric-card p {{
-                    color: #7f8c8d;
-                    font-size: 0.9rem;
-                    margin: 5px 0 0 0;
-                }}
-                .metric-card:hover {{
-                    transform: translateY(-5px);
-                    box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
-                }}
-                /* Tooltip for full value on hover */
-                .metric-tooltip {{
-                    position: relative;
-                    display: inline-block;
-                    width: 100%;
-                }}
-                .metric-tooltip .tooltiptext {{
-                    visibility: hidden;
-                    width: auto;
-                    background-color: #333;
-                    color: #fff;
-                    text-align: center;
-                    border-radius: 6px;
-                    padding: 5px 10px;
-                    position: absolute;
-                    z-index: 1;
-                    bottom: 125%;
-                    left: 50%;
-                    transform: translateX(-50%);
-                    opacity: 0;
-                    transition: opacity 0.3s;
-                    white-space: nowrap;
-                    font-size: 0.9rem;
-                }}
-                .metric-tooltip:hover .tooltiptext {{
-                    visibility: visible;
-                    opacity: 1;
-                }}
-                @media (max-width: 768px) {{
-                    .metrics-grid {{
-                        grid-template-columns: 1fr 1fr;
-                    }}
-                }}
-                @media (max-width: 480px) {{
-                    .metrics-grid {{
-                        grid-template-columns: 1fr;
-                    }}
-                }}
-                
-                    margin-bottom: 20px;
-                    width: 100%;
-                }}
-                .metric-card {{
-                    background: #f8f9fa;
-                    border-radius: 10px;
-                    padding: 15px;
-                    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-                    min-width: 0; /* Prevents overflow */
-                }}
-                .metric-title {{
-                    font-size: 14px;
-                    color: #6c757d;
-                    margin-bottom: 8px;
-                    white-space: nowrap;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                }}
-                .metric-value {{
-                    font-size: 16px;
-                    font-weight: 600;
-                    color: #212529;
-                    white-space: nowrap;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                }}
-                .metric-delta {{
-                    font-size: 12px;
-                    color: #28a745;
-                    margin-top: 4px;
-                }}
-                .metric-delta.negative {{
-                    color: #dc3545;
-                }}
-                @media (max-width: 992px) {{
-                    .metrics-grid {{
-                        grid-template-columns: repeat(2, 1fr);
-                    }}
-                }}
-                @media (max-width: 576px) {{
-                    .metrics-grid {{
-                        grid-template-columns: 1fr;
-                    }}
-                }}
-                </style>
-                
-                <div class="metrics-grid">
-                    <div class="metric-card">
-                        <h3>Total Revenue</h3>
-                        <div class="metric-tooltip">
-                            <h2>Kshs {total_sales:,.2f}</h2>
-                            <span class="tooltiptext">Kshs {total_sales:,.2f}</span>
-                        </div>
-                        <p>All-time sales revenue</p>
-                    </div>
-                    <div class="metric-card">
-                        <h3>Total Expenses</h3>
-                        <div class="metric-tooltip">
-                            <h2>Kshs {total_expenses:,.2f}</h2>
-                            <span class="tooltiptext">Kshs {total_expenses:,.2f}</span>
-                        </div>
-                        <p>All-time operational costs</p>
-                    </div>
-                    <div class="metric-card">
-                        <h3>Net Profit</h3>
-                        <div class="metric-tooltip">
-                            <h2 style="color: {'#27ae60' if net_profit >= 0 else '#e74c3c'}">
-                                {'+' if net_profit >= 0 else ''}Kshs {abs(net_profit):,.2f}
-                            </h2>
-                            <span class="tooltiptext">{'+' if net_profit >= 0 else ''}Kshs {abs(net_profit):,.2f}</span>
-                        </div>
-                        <p style="color: {'#27ae60' if net_profit >= 0 else '#e74c3c'}">
-                            ({'+' if net_profit >= 0 else ''}{(net_profit/total_sales*100) if total_sales > 0 else 0:.1f}% margin)
-                        </p>
-                    </div>
-                    <div class="metric-card">
-                        <h3>Profit Margin</h3>
-                        <div class="metric-tooltip">
-                            <h2 style="color: {'#27ae60' if gross_profit_margin >= 0 else '#e74c3c'}">
-                                {gross_profit_margin:,.1f}%
-                            </h2>
-                            <span class="tooltiptext">{gross_profit_margin:,.1f}%</span>
-                        </div>
-                        <p>{(total_sales - total_expenses):,.0f} / {total_sales:,.0f}</p>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Add a divider and link to Insights tab
-                st.markdown("---")
-                st.markdown("""
-                <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin: 20px 0;">
-                    <h3>🔍 Want more detailed financial insights?</h3>
-                    <p>Visit the <strong>Insights</strong> tab for comprehensive financial analysis including:</p>
-                    <ul>
-                        <li>Expense breakdown by category</li>
-                        <li>Revenue streams analysis</li>
-                        <li>Financial health indicators</li>
-                        <li>Trend analysis over time</li>
-                        <li>Detailed transaction history</li>
-                    </ul>
-                    <p>Click on the <strong>Insights</strong> tab at the top to explore more.</p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Recent Transactions
-                st.markdown("### Recent Transactions")
-                recent_transactions = fin_df[['Date', 'Type', 'Category', 'Description', 'Amount']]\
-                    .sort_values('Date', ascending=False).head(10)
-                
-                if not recent_transactions.empty:
-                    st.dataframe(
-                        recent_transactions,
-                        column_config={
-                            'Date': st.column_config.DateColumn("Date", format="DD/MM/YYYY"),
-                            'Amount': st.column_config.NumberColumn("Amount (Kshs)", format="%.2f")
-                        },
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.info("No recent transactions found.")
-                    
-            else:
-                st.info("No financial data available. Add financial records to see insights.")
-                
-                # Add call to action
-                st.markdown("""
-                <div style="background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin: 20px 0;">
-                    <h3>📊 Ready to track your finances?</h3>
-                    <p>Start by adding your financial records to unlock powerful insights into your hog farming business.</p>
-                    <p>Once you add data, you'll be able to track revenues, expenses, and profitability.</p>
-                </div>
-                """, unsafe_allow_html=True)
-        
-    with tab_efficiency:
-        st.markdown("### 🥗 Feed Conversion Ratio (FCR)")
-        
-        # Initialize display_data if not already defined
-        if 'display_data' not in locals() or display_data is None or display_data.empty:
-            display_data = pd.DataFrame()
+                # Display key insights
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Total Hogs", total_hogs)
+                    st.metric("Total Records", total_records)
+                with col2:
+                    st.metric("Average Weight", f"{avg_weight:.1f} kg")
+                    st.metric("Weight Std Dev", f"{weight_std:.2f} kg")
             
-        if not st.session_state['financial_data'].empty and not display_data.empty and 'Hog ID' in display_data.columns:
-            feed_df = st.session_state['financial_data'].copy()
-            feed_df = feed_df[feed_df['Category'] == 'Feed']
-            total_feed = feed_df['Amount'].sum()
-                    
-            # Calculate total weight gain
-            weight_gains = []
-            valid_hogs = 0
+            # Performance distribution
+            st.markdown("#### 📊 Performance Distribution")
             
-            for hog_id in display_data['Hog ID'].unique():
-                hog_data = display_data[display_data['Hog ID'] == hog_id].sort_values(by='Date')
-                if len(hog_data) > 1 and 'Weight (kg)' in hog_data.columns:
-                    try:
+            # Weight distribution analysis
+            weight_categories = pd.cut(display_data['Weight (kg)'], 
+                                     bins=[0, 50, 100, 150, float('inf')],
+                                     labels=['< 50kg', '50-100kg', '100-150kg', '> 150kg'])
+            
+            fig_weight_dist = px.pie(
+                values=weight_categories.value_counts(),
+                names=weight_categories.cat.categories,
+                title="Weight Distribution Categories",
+                color_discrete_sequence=px.colors.qualitative.Set3
+            )
+            fig_weight_dist.update_traces(textposition='inside', textinfo='percent+label')
+            st.plotly_chart(fig_weight_dist, use_container_width=True, key="chart_insights_1")
+            
+            # Growth rate analysis
+            st.markdown("#### 📈 Growth Analysis")
+            # Create hog_dict for mapping formatted hogs to original IDs from display_data
+            unique_hogs = sorted(display_data['Hog ID'].unique())
+            formatted_hogs = [f"{int(hog):03d}" for hog in unique_hogs]
+            hog_dict = dict(zip(formatted_hogs, unique_hogs))
+            selected_hogs = formatted_hogs  # Use all hogs by default
+            
+            if len(selected_hogs) > 0:
+                growth_analysis = []
+                for hog_id in selected_hogs:
+                    hog_data = display_data[display_data['Hog ID'] == hog_dict[hog_id]].sort_values('Date')
+                    if len(hog_data) > 1:
                         initial_weight = hog_data['Weight (kg)'].iloc[0]
                         final_weight = hog_data['Weight (kg)'].iloc[-1]
-                        if pd.notna(initial_weight) and pd.notna(final_weight):
-                            gain = final_weight - initial_weight
-                            if gain > 0:  # Only include positive gains
-                                weight_gains.append((hog_id, gain))
-                                valid_hogs += 1
-                    except (IndexError, KeyError):
-                        continue  # Skip this hog if there's an error in weight data
-            
-            total_weight_gain = sum(gain for _, gain in weight_gains) if weight_gains else 0
-            
-            if total_weight_gain > 0 and total_feed > 0:
-                fcr = total_feed / total_weight_gain
-            else:
-                fcr = None
-                
-            if valid_hogs == 0:
-                st.warning("No valid hog weight data available for FCR calculation.")
-                return
-            
-            # Display FCR metrics
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Total Feed Consumed", f"{total_feed:,.1f} kg")
-            with col2:
-                st.metric("Total Weight Gain", f"{total_weight_gain:,.1f} kg")
-            with col3:
-                if fcr is not None:
-                    st.metric("Feed Conversion Ratio (FCR)", f"{fcr:.2f}", 
-                             help="Lower is better. Represents kg of feed per kg of weight gain")
-                else:
-                    st.metric("Feed Conversion Ratio (FCR)", "N/A", 
-                             help="Insufficient data to calculate FCR")
-            
-            # Display FCR by hog
-            st.markdown("### 🐖 FCR by Hog")
-            hog_fcr = []
-            for hog_id, gain in weight_gains:
-                hog_feed = feed_df[feed_df['Hog ID'] == hog_id]['Amount'].sum()
-                hog_fcr.append({
-                    'Hog ID': hog_id,
-                    'Feed Consumed (kg)': hog_feed,
-                    'Weight Gain (kg)': gain,
-                    'FCR': hog_feed / gain if gain > 0 else None
-                })
-                
-                if hog_fcr:
-                    try:
-                        # Create DataFrame and handle potential data issues
-                        fcr_df = pd.DataFrame(hog_fcr)
+                        weight_gain = final_weight - initial_weight
+                        days = (hog_data['Date'].iloc[-1] - hog_data['Date'].iloc[0]).days
                         
-                        # Ensure we have the required columns
-                        required_cols = ['Hog ID', 'FCR']
-                        if all(col in fcr_df.columns for col in required_cols):
-                            # Sort by FCR, handling any None values
-                            fcr_df = fcr_df.sort_values('FCR', na_position='last')
-                            
-                            # Create a bar chart for FCR by hog
-                            fig = px.bar(
-                                fcr_df,
-                                x='Hog ID',
-                                y='FCR',
-                                title='Feed Conversion Ratio by Hog',
-                                labels={'FCR': 'Feed Conversion Ratio (kg/kg)', 'Hog ID': 'Hog ID'},
-                                color='FCR',
-                                color_continuous_scale='RdYlGn_r',  # Red-Yellow-Green (reversed, so green is best)
-                                text='FCR'
-                            )
-                            
-                            fig.update_traces(
-                                hovertemplate='<b>Hog %{x}</b><br>FCR: %{y:.2f} kg/kg<extra></extra>',
-                                texttemplate='%{text:.1f}',
-                                textposition='outside'
-                            )
-                            
-                            fig.update_layout(
-                                xaxis_title='Hog ID',
-                                yaxis_title='Feed Conversion Ratio (kg/kg)',
-                                coloraxis_showscale=False,
-                                height=400,
-                                yaxis=dict(range=[0, fcr_df['FCR'].max() * 1.1])  # Add some padding to the top
-                            )
-                            
-                            st.plotly_chart(fig, use_container_width=True)
-                            
-                            # Add a small data table below the chart
-                            st.markdown("#### Detailed FCR Data")
-                            display_cols = ['Hog ID', 'Feed (kg)', 'Weight Gain (kg)', 'FCR']
-                            display_df = fcr_df[display_cols].copy()
-                            display_df['FCR'] = display_df['FCR'].round(2)
-                            st.dataframe(
-                                display_df.style.format({
-                                    'Feed (kg)': '{:.1f}',
-                                    'Weight Gain (kg)': '{:.1f}',
-                                    'FCR': '{:.2f}'
-                                }),
-                                use_container_width=True,
-                                height=min(300, 35 * len(display_df) + 30)  # Dynamic height
-                            )
-                        else:
-                            st.warning("Required columns for FCR calculation are missing.")
-                    except Exception as e:
-                        st.error(f"Error creating FCR visualization: {str(e)}")
+                        if days > 0 and weight_gain > 0:
+                            daily_gain = weight_gain / days
+                            growth_analysis.append({
+                                'Hog ID': hog_id,
+                                'Daily Gain (kg/day)': daily_gain,
+                                'Total Gain (kg)': weight_gain,
+                                'Days Tracked': days
+                            })
+                
+                if growth_analysis:
+                    # Create DataFrame and handle potential data issues
+                    growth_df = pd.DataFrame(growth_analysis)
+                    
+                    # Ensure we have the required columns
+                    required_cols = ['Hog ID', 'Daily Gain (kg/day)', 'Total Gain (kg)', 'Days Tracked']
+                    if all(col in growth_df.columns for col in required_cols):
+                        # Sort by daily gain, handling any None values
+                        growth_df = growth_df.sort_values('Daily Gain (kg/day)', na_position='last')
+                        
+                        # Create a bar chart for growth by hog
+                        fig = px.bar(
+                            growth_df,
+                            x='Hog ID',
+                            y='Daily Gain (kg/day)',
+                            title='Daily Weight Gain by Hog',
+                            labels={'Daily Gain (kg/day)': 'Daily Gain (kg/day)', 'Hog ID': 'Hog ID'},
+                            color='Daily Gain (kg/day)',
+                            color_continuous_scale='RdYlGn_r',  # Red-Yellow-Green (reversed, so green is best)
+                            text='Daily Gain (kg/day)'
+                        )
+                        
+                        fig.update_traces(
+                            hovertemplate='<b>Hog %{x}</b><br>Daily Gain: %{y:.2f} kg/day<extra></extra>',
+                            texttemplate='%{text:.1f}',
+                            textposition='outside'
+                        )
+                        
+                        fig.update_layout(
+                            xaxis_title='Hog ID',
+                            yaxis_title='Daily Weight Gain (kg/day)',
+                            coloraxis_showscale=False,
+                            height=400,
+                            yaxis=dict(range=[0, growth_df['Daily Gain (kg/day)'].max() * 1.1])  # Add some padding to the top
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True, key="chart_8")
+                        
+                        # Add a small data table below the chart
+                        st.markdown("#### Detailed Growth Data")
+                        display_cols = ['Hog ID', 'Daily Gain (kg/day)', 'Total Gain (kg)', 'Days Tracked']
+                        display_df = growth_df[display_cols].copy()
+                        display_df['Daily Gain (kg/day)'] = display_df['Daily Gain (kg/day)'].round(2)
+                        st.dataframe(
+                            display_df.style.format({
+                                'Daily Gain (kg/day)': '{:.2f}',
+                                'Total Gain (kg)': '{:.1f}',
+                                'Days Tracked': '{:.0f}'
+                            }),
+                            use_container_width=True,
+                            height=min(300, 35 * len(display_df) + 30)  # Dynamic height
+                        )
+                    else:
+                        st.warning("Required columns for growth analysis are missing.")
                 else:
-                    st.info("No valid hog FCR data available. Ensure you have:")
+                    st.info("No valid hog growth data available. Ensure you have:")
                     st.markdown("""
                     - Multiple weight recordings per hog
                     - Positive weight gains
-                    - Valid feed data
+                    - Valid date data
                     """)
+            if 'display_data' not in locals() or display_data is None or display_data.empty:
+                display_data = pd.DataFrame()
+        
+        with tab_efficiency:
+            st.markdown("### 🥗 Feed Conversion Ratio (FCR)")
+            
+            # Initialize display_data if not already defined
+            if 'display_data' not in locals() or display_data is None or display_data.empty:
+                display_data = pd.DataFrame()
+                
+            if not st.session_state['financial_data'].empty and not display_data.empty and 'Hog ID' in display_data.columns:
+                feed_df = st.session_state['financial_data'].copy()
+                feed_df = feed_df[feed_df['Category'] == 'Feed']
+                total_feed = feed_df['Amount'].sum()
+                
+                # Calculate total weight gain
+                weight_gains = []
+                valid_hogs = 0
+                
+                for hog_id in display_data['Hog ID'].unique():
+                    hog_data = display_data[display_data['Hog ID'] == hog_id].sort_values(by='Date')
+                    if len(hog_data) > 1 and 'Weight (kg)' in hog_data.columns:
+                        try:
+                            initial_weight = hog_data['Weight (kg)'].iloc[0]
+                            final_weight = hog_data['Weight (kg)'].iloc[-1]
+                            if pd.notna(initial_weight) and pd.notna(final_weight):
+                                gain = final_weight - initial_weight
+                                if gain > 0:  # Only include positive gains
+                                    weight_gains.append((hog_id, gain))
+                                    valid_hogs += 1
+                        except (IndexError, KeyError):
+                            continue  # Skip this hog if there's an error in weight data
+            
+                total_weight_gain = sum(gain for _, gain in weight_gains) if weight_gains else 0
+                
+                if total_weight_gain > 0 and total_feed > 0:
+                    fcr = total_feed / total_weight_gain
+                else:
+                    fcr = None
+                    
+                if valid_hogs == 0:
+                    st.warning("No valid hog weight data available for FCR calculation.")
+                    return
+                
+                # Display FCR metrics
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Total Feed Consumed", f"{total_feed:,.1f} kg")
+                with col2:
+                    st.metric("Total Weight Gain", f"{total_weight_gain:,.1f} kg")
+                with col3:
+                    if fcr is not None:
+                        st.metric("Feed Conversion Ratio (FCR)", f"{fcr:.2f}", 
+                                 help="Lower is better. Represents kg of feed per kg of weight gain")
+                    else:
+                        st.metric("Feed Conversion Ratio (FCR)", "N/A", 
+                                 help="Insufficient data to calculate FCR")
+                
+                # Display FCR by hog
+                st.markdown("### 🐖 FCR by Hog")
+                hog_fcr = []
+                for hog_id, gain in weight_gains:
+                    hog_feed = feed_df[feed_df['Hog ID'] == hog_id]['Amount'].sum()
+                    hog_fcr.append({
+                        'Hog ID': hog_id,
+                        'Feed Consumed (kg)': hog_feed,
+                        'Weight Gain (kg)': gain,
+                        'FCR': hog_feed / gain if gain > 0 else None
+                    })
+                    
+                    if hog_fcr:
+                        try:
+                            # Create DataFrame and handle potential data issues
+                            fcr_df = pd.DataFrame(hog_fcr)
+                            
+                            # Ensure we have the required columns
+                            required_cols = ['Hog ID', 'FCR']
+                            if all(col in fcr_df.columns for col in required_cols):
+                                # Sort by FCR, handling any None values
+                                fcr_df = fcr_df.sort_values('FCR', na_position='last')
+                                
+                                # Create a bar chart for FCR by hog
+                                fig = px.bar(
+                                    fcr_df,
+                                    x='Hog ID',
+                                    y='FCR',
+                                    title='Feed Conversion Ratio by Hog',
+                                    labels={'FCR': 'Feed Conversion Ratio (kg/kg)', 'Hog ID': 'Hog ID'},
+                                    color='FCR',
+                                    color_continuous_scale='RdYlGn_r',  # Red-Yellow-Green (reversed, so green is best)
+                                    text='FCR'
+                                )
+                                
+                                fig.update_traces(
+                                    hovertemplate='<b>Hog %{x}</b><br>FCR: %{y:.2f} kg/kg<extra></extra>',
+                                    texttemplate='%{text:.1f}',
+                                    textposition='outside'
+                                )
+                                
+                                fig.update_layout(
+                                    xaxis_title='Hog ID',
+                                    yaxis_title='Feed Conversion Ratio (kg/kg)',
+                                    coloraxis_showscale=False,
+                                    height=400,
+                                    yaxis=dict(range=[0, fcr_df['FCR'].max() * 1.1])  # Add some padding to the top
+                                )
+                                
+                                st.plotly_chart(fig, use_container_width=True, key="chart_9")
+                                
+                                # Add a small data table below the chart
+                                st.markdown("#### Detailed FCR Data")
+                                display_cols = ['Hog ID', 'Feed (kg)', 'Weight Gain (kg)', 'FCR']
+                                display_df = fcr_df[display_cols].copy()
+                                display_df['FCR'] = display_df['FCR'].round(2)
+                                st.dataframe(
+                                    display_df.style.format({
+                                        'Feed (kg)': '{:.1f}',
+                                        'Weight Gain (kg)': '{:.1f}',
+                                        'FCR': '{:.2f}'
+                                    }),
+                                    use_container_width=True,
+                                    height=min(300, 35 * len(display_df) + 30)  # Dynamic height
+                                )
+                            else:
+                                st.warning("Required columns for FCR calculation are missing.")
+                        except Exception as e:
+                            st.error(f"Error creating FCR visualization: {str(e)}")
+                    else:
+                        st.info("No valid hog FCR data available. Ensure you have:")
+                        st.markdown("""
+                        - Multiple weight recordings per hog
+                        - Positive weight gains
+                        - Valid feed data
+                        """)
             else:
-                st.info("No weight gain data available for FCR calculation.")
-        else:
-            st.info("No financial or weight data available for FCR analysis.")
+                st.info("No financial or weight data available for FCR analysis.")
         
         with tab_growth:
             st.markdown("### 📈 Week-to-Week Growth Analysis")
@@ -3399,7 +3955,7 @@ def main():
                         )
                         
                         # Display the chart
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, key="chart_10")
                         
                         # Add a small table showing the latest growth data for selected hogs
                         st.markdown("#### 📋 Latest Growth Data")
@@ -3680,7 +4236,7 @@ def main():
                                     • Total Measurements: {len(all_growth_data)}
                                     """
                                     st.markdown(stats_text)
-                                    st.plotly_chart(fig, use_container_width=True)
+                                    st.plotly_chart(fig, use_container_width=True, key="chart_11")
                                     
                                     # Show detailed table of potential issues
                                     st.markdown("#### ⚠️ Potential Issues Detected")
@@ -3950,7 +4506,7 @@ def main():
                     fig_plotly.update_traces(hovertemplate='Date: %{x}<br>Weight: %{y:.1f}kg')
                     fig_plotly.update_xaxes(tickangle=45)
 
-                    st.plotly_chart(fig_plotly, use_container_width=True)
+                    st.plotly_chart(fig_plotly, use_container_width=True, key="chart_12")
                     
                 elif hog_data_for_plot['Weight (kg)'].nunique() <= 1:
                     st.info(f"Not enough data to plot trend for Hog {selected_hog_id_for_growth}. Need at least two different weight entries.")
@@ -4201,7 +4757,7 @@ def main():
                             height=400
                         )
                         
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, key="chart_13")
                         
                         # Simple statistics
                         stats = week_data['Weight Change (kg)'].describe()
@@ -4317,9 +4873,65 @@ def main():
         # Only admin/staff can add/edit financials; viewers can only view
         can_edit_financials = st.session_state['user_role'] in ['admin', 'staff']
         st.header("💼 Financials")
+        
+        # --- Financial Summary Metrics ---
+        # Initialize expenses_df from session state for summary metrics
+        expenses_df = pd.DataFrame()
+        if not st.session_state['financial_data'].empty:
+            expenses_df = st.session_state['financial_data'][st.session_state['financial_data']['Type'] == 'Expense'].copy()
+        
+        if not expenses_df.empty:
+            # Calculate summary metrics
+            total_expenses = expenses_df['Amount'].sum()
+            avg_expense = expenses_df['Amount'].mean()
+            expense_count = len(expenses_df)
+            
+            # Create summary cards with custom HTML to prevent truncation
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown(f"""
+                <div class="custom-metric">
+                    <div class="custom-metric-label">💰 Total Expenses</div>
+                    <div class="custom-metric-value">Kshs {total_expenses:,.2f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown(f"""
+                <div class="custom-metric">
+                    <div class="custom-metric-label">📊 Average Expense</div>
+                    <div class="custom-metric-value">Kshs {avg_expense:,.2f}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with col3:
+                st.markdown(f"""
+                <div class="custom-metric">
+                    <div class="custom-metric-label">📈 Total Records</div>
+                    <div class="custom-metric-value">{expense_count:,}</div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+        
+        # Initialize tab state if not exists
+        if 'financials_active_tab' not in st.session_state:
+            st.session_state['financials_active_tab'] = 0
+        
         subtab_expenses, subtab_budgets, subtab_recurring, subtab_categories, subtab_insights, subtab_sales = st.tabs([
             "Expenses", "Budgets", "Recurring Expenses", "Categories", "Insights", "Sales"
         ])
+        
+        # Update active tab based on user interaction
+        current_tab_index = 0
+        tab_names = ["Expenses", "Budgets", "Recurring Expenses", "Categories", "Insights", "Sales"]
+        if 'financials_tab_clicked' in st.session_state:
+            current_tab_index = st.session_state['financials_tab_clicked']
+            st.session_state['financials_active_tab'] = current_tab_index
+            # del st.session_state['financials_tab_clicked']  # Commented out to preserve navigation state
+        else:
+            current_tab_index = st.session_state.get('financials_active_tab', 0)
 
         with subtab_expenses:
             # Add custom CSS for better styling
@@ -4532,7 +5144,7 @@ def main():
                                             # Add as a simple string to maintain consistency
                                             current_subs.append(new_subcategory.strip())
                                             st.success(f"Added subcategory: {new_subcategory.strip()}")
-                                            st.rerun()
+                                            st.session_state['data_refresh_needed'] = True
                                         else:
                                             st.warning("This subcategory already exists.")
                                             st.session_state['new_subcategory'] = new_subcategory.strip()
@@ -4612,41 +5224,6 @@ def main():
                             else:
                                 st.error("❌ Please enter a name for the new category.")
                                 st.stop()
-                        
-                        if not current_description.strip() or current_amount <= 0:
-                            st.error("❌ Please fill in all required fields and ensure amount is greater than 0.")
-                            st.stop()
-                        
-                        # Get the subcategory if available
-                        subcategory = st.session_state.get('new_subcategory', '')
-                        
-                        # If we have a subcategory, use it in the description
-                        description = f"{subcategory}: {current_description}" if subcategory and subcategory != "Select a subcategory..." else current_description
-                        
-                        # Add the expense
-                        try:
-                            new_expense = pd.DataFrame([{
-                                'Date': expense_date,
-                                'Type': 'Expense',
-                                'Category': final_category,
-                                'Subcategory': subcategory if subcategory and subcategory != "Select a subcategory..." else "",
-                                'Description': description,
-                                'Hog ID': pd.NA,
-                                'Weight (kg)': pd.NA,
-                                'Price/kg': pd.NA,
-                                'Amount': current_amount
-                            }])
-                            
-                            st.session_state['financial_data'] = pd.concat(
-                                [st.session_state['financial_data'], new_expense], 
-                                ignore_index=True
-                            )
-                            save_financial_data(st.session_state['financial_data'])
-                            
-                            # Force refresh of financial data from CSV to ensure consistency
-                            st.session_state['financial_data'] = load_financial_data()
-                            
-                            st.success("✅ Expense added successfully!")
                             st.balloons()
                             
                             # Increment form key to force a new form instance
@@ -4657,649 +5234,348 @@ def main():
                             st.session_state['new_subcategory'] = ""
                             
                             # Force a rerun to update the UI with default values
-                            st.rerun()
+                            st.session_state['data_refresh_needed'] = True
+                        try:
+                            # Save expense to session state
+                            if 'financial_data' not in st.session_state:
+                                st.session_state['financial_data'] = pd.DataFrame(columns=['Date', 'Category', 'Description', 'Amount', 'Type'])
+                            
+                            new_expense = pd.DataFrame({
+                                'Date': [expense_date],
+                                'Category': [final_category],
+                                'Description': [expense_description],
+                                'Amount': [expense_amount],
+                                'Type': ['Expense']
+                            })
+                            
+                            st.session_state['financial_data'] = pd.concat([st.session_state['financial_data'], new_expense], ignore_index=True)
+                            
+                            # Save to persistent storage
+                            save_financial_data(st.session_state['financial_data'])
+                            
+                            st.success("Expense added successfully!")
+                            st.balloons()
+                            
+                            # Increment form key to force a new form instance
+                            st.session_state['form_key'] += 1
+                            
+                            # Reset the category and subcategory
+                            st.session_state['expense_category'] = 'Choose a Category'
+                            st.session_state['new_subcategory'] = ""
+                            
+                            # Force a rerun to update the UI with default values
+                            st.session_state['data_refresh_needed'] = True
                         except Exception as e:
                             st.error(f"❌ An error occurred while saving the expense: {str(e)}")
-        
-        # --- Expense Analytics Section ---
-        # Initialize variables with default values
-        total_expenses = 0
-        avg_expense = 0
-        expense_count = 0
-        expenses_df = pd.DataFrame()
-        category_summary = pd.DataFrame(columns=['Category', 'Total Amount', 'Number of Expenses'])
-        
-        if not st.session_state['financial_data'].empty:
-            expenses_df = st.session_state['financial_data'][st.session_state['financial_data']['Type'] == 'Expense'].copy()
-            
-            if not expenses_df.empty:
-                # Calculate summary metrics
-                total_expenses = expenses_df['Amount'].sum()
-                avg_expense = expenses_df['Amount'].mean()
-                expense_count = len(expenses_df)
                 
-                # Create summary cards
-                col1, col2, col3 = st.columns(3)
+                # Simple expense selection
+                # Initialize expenses_df from session state
+                expenses_df = pd.DataFrame()
+                if not st.session_state['financial_data'].empty:
+                    expenses_df = st.session_state['financial_data'][st.session_state['financial_data']['Type'] == 'Expense'].copy()
+                
+                if not expenses_df.empty:
+                    col1, col2 = st.columns([3, 1])
                 
                 with col1:
-                    st.metric(
-                        label="Total Expenses",
-                        value=f"Kshs {total_expenses:,.2f}",
-                        help="Sum of all recorded expenses"
+                    # Create readable expense options
+                    expense_options = {}
+                    for idx, row in expenses_df.iterrows():
+                        date_str = row['Date'].strftime('%Y-%m-%d') if hasattr(row['Date'], 'strftime') else str(row['Date'])
+                        description = str(row['Description']) if pd.notna(row['Description']) else 'No description'
+                        label = f"{date_str} | {row['Category']} | {description} | Kshs {row['Amount']:,.2f}"
+                        expense_options[label] = idx
+                    
+                    selected_expense = st.selectbox(
+                        "Select expense to edit or delete:",
+                        options=["Select an expense..."] + list(expense_options.keys()),
+                        key="simple_expense_select"
                     )
                 
                 with col2:
-                    st.metric(
-                        label="Average Expense",
-                        value=f"Kshs {avg_expense:,.2f}",
-                        help="Average amount per expense"
-                    )
-                
-                with col3:
-                    st.metric(
-                        label="Total Records",
-                        value=f"{expense_count:,}",
-                        help="Number of expense records"
-                    )
-        
-        # --- Expense Category Breakdown ---
-        st.markdown("### 📈 Expense Analysis")
-        
-        # Create tabs for different visualizations
-        tab1, tab2 = st.tabs(["By Category", "Over Time"])
-        
-        with tab1:
-            st.markdown("#### 🥧 Expense Distribution by Category")
-            if not expenses_df.empty and 'Category' in expenses_df.columns:
-                category_summary = expenses_df.groupby('Category')['Amount'].agg(['sum', 'count']).reset_index()
-                category_summary.columns = ['Category', 'Total Amount', 'Number of Expenses']
-                category_summary = category_summary.sort_values('Total Amount', ascending=False)
+                    if selected_expense != "Select an expense...":
+                        st.markdown("**Actions:**")
+                        if st.button("✏️ Edit", key="edit_expense_btn", use_container_width=True):
+                            st.session_state['edit_mode'] = True
+                            st.session_state['delete_mode'] = False
+                            st.session_state['selected_expense_idx'] = expense_options[selected_expense]
+                            st.session_state['financials_tab_clicked'] = 0  # Stay on Expenses tab
+                            st.rerun()
+                        
+                        if st.button("🗑️ Delete", key="delete_expense_btn", use_container_width=True):
+                            st.session_state['delete_mode'] = True
+                            st.session_state['edit_mode'] = False
+                            st.session_state['selected_expense_idx'] = expense_options[selected_expense]
+                            st.session_state['financials_tab_clicked'] = 0  # Stay on Expenses tab
+                            st.rerun()
             
-            # Display top categories as metrics
-            if not category_summary.empty:
-                top_categories = category_summary.head(3)
-                cols = st.columns(3)
-                for idx, (_, row) in enumerate(top_categories.iterrows()):
-                    with cols[idx % 3]:
-                        percentage = (row['Total Amount'] / total_expenses) * 100 if total_expenses > 0 else 0
-                        st.metric(
-                            label=f"{row['Category']}",
-                            value=f"Kshs {row['Total Amount']:,.2f}",
-                            delta=f"{percentage:.1f}% of total"
+            # Edit Form
+            if st.session_state.get('edit_mode', False) and 'selected_expense_idx' in st.session_state:
+                idx = st.session_state['selected_expense_idx']
+                expense = expenses_df.loc[idx]
+                
+                st.markdown("---")
+                st.markdown("#### ✏️ Edit Expense")
+                
+                with st.form(key="edit_expense_form"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        edit_date = st.date_input("Date", value=pd.to_datetime(expense['Date']).date())
+                        edit_category = st.selectbox("Category", 
+                            ['Feed', 'Veterinary', 'Labor', 'Utilities', 'Equipment', 'Other'],
+                            index=['Feed', 'Veterinary', 'Labor', 'Utilities', 'Equipment', 'Other'].index(expense['Category']) 
+                            if expense['Category'] in ['Feed', 'Veterinary', 'Labor', 'Utilities', 'Equipment', 'Other'] else 0
                         )
+                    
+                    with col2:
+                        edit_amount = st.number_input("Amount (Kshs)", min_value=0.0, value=float(expense['Amount']), format="%.2f")
+                        edit_description = st.text_input("Description", value=expense['Description'] if pd.notna(expense['Description']) else "")
+                    
+                    col_save, col_cancel = st.columns(2)
+                    
+                    with col_save:
+                        submit_edit = st.form_submit_button("💾 Save Changes", use_container_width=True)
+                    
+                    with col_cancel:
+                        cancel_edit = st.form_submit_button("❌ Cancel", use_container_width=True)
+                    
+                    if submit_edit:
+                        # Update database
+                        updated_data = {
+                            'Date': edit_date.strftime('%Y-%m-%d'),
+                            'Category': edit_category,
+                            'Description': edit_description,
+                            'Amount': edit_amount,
+                            'Type': 'Expense'
+                        }
+                        
+                        # Add ID if exists
+                        if 'id' in expense and pd.notna(expense['id']):
+                            updated_data['id'] = expense['id']
+                            result = save_financial_transaction_to_db(updated_data)
+                            if result:
+                                st.success("✅ Expense updated successfully!")
+                                st.balloons()
+                        else:
+                            st.warning("⚠️ No database ID found - update may not work properly")
+                        
+                        # Clear edit mode and refresh
+                        st.session_state['edit_mode'] = False
+                        st.session_state['data_refresh_needed'] = True
+                        st.session_state['financials_tab_clicked'] = 0  # Stay on Expenses tab
+                        st.rerun()
+                    
+                    if cancel_edit:
+                        st.session_state['edit_mode'] = False
+                        st.session_state['financials_tab_clicked'] = 0  # Stay on Expenses tab
+                        st.rerun()
             
-            # Show full category breakdown in columns
-            col1, col2 = st.columns([1, 2])
-            
-            with col1:
-                st.markdown("#### 📋 Category Details")
-                if not category_summary.empty:
-                    st.dataframe(
-                        category_summary.rename(columns={
-                            'Category': 'Category',
-                            'Total Amount': 'Total (Kshs)',
-                            'Number of Expenses': 'Count'
-                        }).style.format({
-                            'Total (Kshs)': '{:,.2f}'
-                        }),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.info("No expense data available to display.")
-            
-            with col2:
-                st.markdown("#### 📊 Distribution")
-                if not category_summary.empty:
-                    fig_pie = px.pie(
-                        category_summary,
-                        values='Total Amount',
-                        names='Category',
-                        color_discrete_sequence=px.colors.qualitative.Pastel,
-                        hole=0.3
-                    )
-                    fig_pie.update_traces(
-                        textposition='inside',
-                        textinfo='percent+label',
-                        hovertemplate='%{label}<br>Kshs %{value:,.2f}<br>%{percent}'
-                    )
-                    fig_pie.update_layout(
-                        showlegend=False,
-                        margin=dict(t=0, b=0, l=0, r=0)
-                    )
-                    st.plotly_chart(fig_pie, use_container_width=True)
-                else:
-                    st.info("No expense data available for chart.")
-        
-        with tab2:
-            st.markdown("#### 📅 Monthly Expense Trends")
-            
-            if not expenses_df.empty and 'Date' in expenses_df.columns:
-                # Group by month and category
-                monthly_expenses = expenses_df.copy()
-                monthly_expenses['Month'] = monthly_expenses['Date'].dt.to_period('M').astype(str)
-                monthly_summary = monthly_expenses.groupby(['Month', 'Category'])['Amount'].sum().reset_index()
+            # Delete Confirmation
+            if st.session_state.get('delete_mode', False) and 'selected_expense_idx' in st.session_state:
+                idx = st.session_state['selected_expense_idx']
+                expense = expenses_df.loc[idx]
                 
-                # Create line chart
-                fig_line = px.line(
-                    monthly_summary,
-                    x='Month',
-                    y='Amount',
-                    color='Category',
-                    title="Monthly Expenses by Category",
-                    markers=True,
-                    color_discrete_sequence=px.colors.qualitative.Pastel
-                )
-                fig_line.update_layout(
-                    xaxis_title="Month",
-                    yaxis_title="Amount (Kshs)",
-                    legend_title="Category",
-                    hovermode='x unified'
-                )
-                fig_line.update_traces(
-                    hovertemplate='%{x}<br>Kshs %{y:,.2f}<extra></extra>'
-                )
-                st.plotly_chart(fig_line, use_container_width=True)
+                st.markdown("---")
+                st.markdown("#### 🗑️ Delete Expense")
+                st.warning(f"Are you sure you want to delete this expense?")
                 
-                # Monthly summary table
-                st.markdown("#### 📅 Monthly Summary")
-                monthly_totals = monthly_expenses.groupby('Month')['Amount'].agg(['sum', 'count']).reset_index()
-                monthly_totals.columns = ['Month', 'Total Amount', 'Number of Expenses']
-                monthly_totals = monthly_totals.sort_values('Month')
+                # Show expense details
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Date", expense['Date'].strftime('%Y-%m-%d') if hasattr(expense['Date'], 'strftime') else str(expense['Date']))
+                with col2:
+                    st.metric("Category", expense['Category'])
+                with col3:
+                    st.metric("Amount", f"Kshs {expense['Amount']:,.2f}")
                 
-                # Calculate month-over-month change
-                monthly_totals['MoM Change'] = monthly_totals['Total Amount'].pct_change() * 100
+                if pd.notna(expense['Description']):
+                    st.write(f"**Description:** {expense['Description']}")
                 
-                st.dataframe(
-                    monthly_totals.style.format({
-                        'Total Amount': 'Kshs {:,.2f}',
-                        'MoM Change': '{:,.1f}%'
-                    }).apply(
-                        lambda x: [''] * len(x) if x.name != len(monthly_totals)-1 
-                        else [''] + [''] + [
-                            'color: green' if val > 0 else 'color: red' if val < 0 else ''
-                            for val in x[2:]
-                        ],
-                        axis=1
-                    ),
-                    use_container_width=True,
-                    hide_index=True
-                )
-            else:
-                st.info("No expense data available for monthly trends analysis.")
+                col_confirm, col_cancel = st.columns(2)
+                
+                with col_confirm:
+                    if st.button("🗑️ Confirm Delete", key="confirm_delete_btn", use_container_width=True):
+                        # Delete from database
+                        if 'id' in expense and pd.notna(expense['id']):
+                            try:
+                                supabase.table('financial_transactions').delete().eq('id', expense['id']).execute()
+                                st.success("✅ Expense deleted successfully!")
+                                st.balloons()
+                            except Exception as e:
+                                st.error(f"❌ Error deleting expense: {str(e)}")
+                        else:
+                            st.warning("⚠️ No database ID found - cannot delete from database")
+                        
+                        # Remove from session state DataFrame
+                        try:
+                            # Get the current financial data
+                            current_data = st.session_state['financial_data'].copy()
+                            # Find and remove the expense by matching all fields
+                            mask = (
+                                (current_data['Date'] == expense['Date']) &
+                                (current_data['Type'] == expense['Type']) &
+                                (current_data['Category'] == expense['Category']) &
+                                (current_data['Description'] == expense['Description']) &
+                                (current_data['Amount'] == expense['Amount'])
+                            )
+                            # Remove matching rows (should be exactly 1)
+                            st.session_state['financial_data'] = current_data[~mask]
+                        except Exception as e:
+                            st.error(f"❌ Error removing from session data: {str(e)}")
+                        
+                        # Clear the cache to force fresh data reload
+                        try:
+                            load_financial_data.clear()
+                        except:
+                            pass
+                        
+                        # Clear delete mode and refresh
+                        st.session_state['delete_mode'] = False
+                        st.session_state['data_refresh_needed'] = True
+                        st.session_state['financials_tab_clicked'] = 0  # Stay on Expenses tab
+                        st.rerun()
+                
+                with col_cancel:
+                    if st.button("❌ Cancel", key="cancel_delete_btn", use_container_width=True):
+                        st.session_state['delete_mode'] = False
+                        st.session_state['financials_tab_clicked'] = 0  # Stay on Expenses tab
+                        st.rerun()
         
         # --- All Expenses Table ---
-        # Add a toggle to show/hide the expenses table
-        show_expenses = st.checkbox(
-            "📋 Show All Expenses",
-            value=False,
-            key='show_all_expenses',
-            help="Toggle to show/hide the detailed expenses table"
-        )
-        
-        if show_expenses:
-            st.markdown("### 📋 All Expenses")
-            
-            # Format the display dataframe
-            expenses_display = expenses_df[['Date', 'Category', 'Description', 'Amount']].copy()
-            expenses_display['Date'] = expenses_display['Date'].dt.strftime('%Y-%m-%d')
-            
-            # Add Excel export button
-            if not expenses_df.empty:
-                # Create a buffer to store the Excel file
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    # Export the actual data (not the display version)
-                    expenses_df.to_excel(writer, index=False, sheet_name='Expenses')
+        if not expenses_df.empty:
+            with st.expander("📊 View All Expenses", expanded=False):
+                st.markdown("### Complete Expense Records")
+                
+                # Add search and filter functionality
+                col1, col2, col3 = st.columns([2, 1, 1])
+                
+                with col1:
+                    search_term = st.text_input("🔍 Search expenses...", placeholder="Search by description, category...", key="expense_search")
+                
+                with col2:
+                    if 'Category' in expenses_df.columns:
+                        categories = ['All Categories'] + sorted(expenses_df['Category'].unique().tolist())
+                        selected_category = st.selectbox("Filter by Category:", categories, key="expense_category_filter")
+                
+                with col3:
+                    date_range = st.selectbox("Date Range:", ['All Time', 'Last 30 Days', 'Last 90 Days', 'This Month'], key="expense_date_filter")
+                
+                # Apply filters
+                filtered_expenses = expenses_df.copy()
+                
+                # Search filter
+                if search_term:
+                    filtered_expenses = filtered_expenses[
+                        filtered_expenses['Description'].str.contains(search_term, case=False, na=False) |
+                        filtered_expenses['Category'].str.contains(search_term, case=False, na=False)
+                    ]
+                
+                # Category filter
+                if selected_category != 'All Categories':
+                    filtered_expenses = filtered_expenses[filtered_expenses['Category'] == selected_category]
+                
+                # Date filter
+                if 'Date' in filtered_expenses.columns:
+                    filtered_expenses['Date'] = pd.to_datetime(filtered_expenses['Date'])
+                    today = pd.Timestamp.now().normalize()
                     
-                    # Get the xlsxwriter workbook and worksheet objects
-                    workbook = writer.book
-                    worksheet = writer.sheets['Expenses']
-                    
-                    # Add a header format
-                    header_format = workbook.add_format({
-                        'bold': True,
-                        'text_wrap': True,
-                        'valign': 'top',
-                        'fg_color': '#4CAF50',
-                        'border': 1,
-                        'font_color': 'white'
-                    })
-                    
-                    # Write the column headers with the defined format
-                    for col_num, value in enumerate(expenses_df.columns.values):
-                        worksheet.write(0, col_num, value, header_format)
-                    
-                    # Set column widths
-                    worksheet.set_column('A:A', 15)  # Date
-                    worksheet.set_column('B:B', 20)  # Category
-                    worksheet.set_column('C:C', 15)  # Subcategory if exists
-                    worksheet.set_column('D:D', 40)  # Description
-                    worksheet.set_column('E:E', 15)  # Amount
-                    tab1, tab2 = st.tabs(["By Category", "Over Time"])
-                    
-                    with tab1:
-                        st.markdown("#### 🥧 Expense Distribution by Category")
-                        category_summary = expenses_df.groupby('Category')['Amount'].agg(['sum', 'count']).reset_index()
-                        category_summary.columns = ['Category', 'Total Amount', 'Number of Expenses']
-                        category_summary = category_summary.sort_values('Total Amount', ascending=False)
-                        
-                        # Display top categories as metrics
-                        if len(category_summary) > 0:
-                            top_categories = category_summary.head(3)
-                            cols = st.columns(3)
-                            for idx, (_, row) in enumerate(top_categories.iterrows()):
-                                with cols[idx % 3]:
-                                    percentage = (row['Total Amount'] / total_expenses) * 100
-                                    st.metric(
-                                        label=f"{row['Category']}",
-                                        value=f"Kshs {row['Total Amount']:,.2f}",
-                                        delta=f"{percentage:.1f}% of total"
-                                    )
-                        
-                        # Show full category breakdown in columns
-                        col1, col2 = st.columns([1, 2])
-                        
-                        with col1:
-                            st.markdown("#### 📋 Category Details")
-                            st.dataframe(
-                                category_summary.rename(columns={
-                                    'Category': 'Category',
-                                    'Total Amount': 'Total (Kshs)',
-                                    'Number of Expenses': 'Count'
-                                }).style.format({
-                                    'Total (Kshs)': '{:,.2f}'
-                                }),
-                                use_container_width=True,
-                                hide_index=True
-                            )
-                        
-                        with col2:
-                            st.markdown("#### 📊 Distribution")
-                            fig_pie = px.pie(
-                                category_summary,
-                                values='Total Amount',
-                                names='Category',
-                                color_discrete_sequence=px.colors.qualitative.Pastel,
-                                hole=0.3
-                            )
-                            fig_pie.update_traces(
-                                textposition='inside',
-                                textinfo='percent+label',
-                                hovertemplate='%{label}<br>Kshs %{value:,.2f}<br>%{percent}'
-                            )
-                            fig_pie.update_layout(
-                                showlegend=False,
-                                margin=dict(t=0, b=0, l=0, r=0)
-                            )
-                            st.plotly_chart(fig_pie, use_container_width=True)
-                    
-                    with tab2:
-                        st.markdown("#### 📅 Monthly Expense Trends")
-                        
-                        # Group by month and category
-                        monthly_expenses = expenses_df.copy()
-                        monthly_expenses['Month'] = monthly_expenses['Date'].dt.to_period('M').astype(str)
-                        monthly_summary = monthly_expenses.groupby(['Month', 'Category'])['Amount'].sum().reset_index()
-                        
-                        # Create line chart
-                        fig_line = px.line(
-                            monthly_summary,
-                            x='Month',
-                            y='Amount',
-                            color='Category',
-                            title="Monthly Expenses by Category",
-                            markers=True,
-                            color_discrete_sequence=px.colors.qualitative.Pastel
-                        )
-                        fig_line.update_layout(
-                            xaxis_title="Month",
-                            yaxis_title="Amount (Kshs)",
-                            legend_title="Category",
-                            hovermode='x unified'
-                        )
-                        fig_line.update_traces(
-                            hovertemplate='%{x}<br>Kshs %{y:,.2f}<extra></extra>'
-                        )
-                        st.plotly_chart(fig_line, use_container_width=True)
-                        
-                        # Monthly summary table
-                        st.markdown("#### 📅 Monthly Summary")
-                        monthly_totals = monthly_expenses.groupby('Month')['Amount'].agg(['sum', 'count']).reset_index()
-                        monthly_totals.columns = ['Month', 'Total Amount', 'Number of Expenses']
-                        monthly_totals = monthly_totals.sort_values('Month')
-                        
-                        # Calculate month-over-month change
-                        monthly_totals['MoM Change'] = monthly_totals['Total Amount'].pct_change() * 100
-                        
-                        st.dataframe(
-                            monthly_totals.style.format({
-                                'Total Amount': 'Kshs {:,.2f}',
-                                'MoM Change': '{:,.1f}%'
-                            }).apply(
-                                lambda x: [''] * len(x) if x.name != len(monthly_totals)-1 
-                                else [''] + [''] + [
-                                    'color: green' if val > 0 else 'color: red' if val < 0 else ''
-                                    for val in x[2:]
-                                ],
-                                axis=1
-                            ),
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                    
-                    # --- All Expenses Table ---
-                    # Add a toggle to show/hide the expenses table
-                    show_expenses = st.checkbox(
-                        "📋 Show All Expenses",
-                        value=False,
-                        key='show_all_expenses',
-                        help="Toggle to show/hide the detailed expenses table"
+                    if date_range == 'Last 30 Days':
+                        filtered_expenses = filtered_expenses[filtered_expenses['Date'] >= today - pd.Timedelta(days=30)]
+                    elif date_range == 'Last 90 Days':
+                        filtered_expenses = filtered_expenses[filtered_expenses['Date'] >= today - pd.Timedelta(days=90)]
+                    elif date_range == 'This Month':
+                        filtered_expenses = filtered_expenses[
+                            (filtered_expenses['Date'].dt.to_period('M') == today.to_period('M'))
+                        ]
+                
+                # Display summary of filtered results
+                st.info(f"📈 Showing {len(filtered_expenses)} of {len(expenses_df)} total expenses")
+                
+                # Format the data for display
+                display_df = filtered_expenses.copy()
+                if 'Date' in display_df.columns:
+                    display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
+                
+                # Rename columns for better display
+                display_columns = {
+                    'Date': 'Date',
+                    'Category': 'Category', 
+                    'Description': 'Description',
+                    'Amount': 'Amount (Kshs)'
+                }
+                
+                # Only show columns that exist
+                available_columns = [col for col in display_columns.keys() if col in display_df.columns]
+                display_df = display_df[available_columns].rename(columns=display_columns)
+                
+                # Format the amount column
+                if 'Amount (Kshs)' in display_df.columns:
+                    display_df['Amount (Kshs)'] = display_df['Amount (Kshs)'].apply(lambda x: f"{x:,.2f}")
+                
+                # Display the table with styling
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Date": st.column_config.TextColumn("Date", width="small"),
+                        "Category": st.column_config.TextColumn("Category", width="medium"),
+                        "Description": st.column_config.TextColumn("Description", width="large"),
+                        "Amount (Kshs)": st.column_config.TextColumn("Amount (Kshs)", width="medium")
+                    }
+                )
+                
+                # Export functionality
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # CSV Export
+                    csv = display_df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=csv,
+                        file_name=f"expenses_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
                     )
+                
+                with col2:
+                    # Excel Export
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                        display_df.to_excel(writer, index=False, sheet_name='Expenses')
+                        worksheet = writer.sheets['Expenses']
+                        worksheet.set_column('A:A', 15)  # Date
+                        worksheet.set_column('B:B', 20)  # Category
+                        worksheet.set_column('C:C', 40)  # Description
+                        worksheet.set_column('D:D', 15)  # Amount
                     
-                    if show_expenses:
-                        st.markdown("### 📋 All Expenses")
-                        
-                        # Format the display dataframe
-                        expenses_display = expenses_df[['Date', 'Category', 'Description', 'Amount']].copy()
-                        expenses_display['Date'] = expenses_display['Date'].dt.strftime('%Y-%m-%d')
-                        
-                        # Add Excel export button
-                        if not expenses_df.empty:
-                            # Create a buffer to store the Excel file
-                            output = io.BytesIO()
-                            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                                # Export the actual data (not the display version)
-                                expenses_df.to_excel(writer, index=False, sheet_name='Expenses')
-                                
-                                # Get the xlsxwriter workbook and worksheet objects
-                                workbook = writer.book
-                                worksheet = writer.sheets['Expenses']
-                                
-                                # Add a header format
-                                header_format = workbook.add_format({
-                                    'bold': True,
-                                    'text_wrap': True,
-                                    'valign': 'top',
-                                    'fg_color': '#4CAF50',
-                                    'border': 1,
-                                    'font_color': 'white'
-                                })
-                                
-                                # Write the column headers with the defined format
-                                for col_num, value in enumerate(expenses_df.columns.values):
-                                    worksheet.write(0, col_num, value, header_format)
-                                
-                                # Set column widths
-                                worksheet.set_column('A:A', 15)  # Date
-                                worksheet.set_column('B:B', 20)  # Category
-                                worksheet.set_column('C:C', 15)  # Subcategory if exists
-                                worksheet.set_column('D:D', 40)  # Description
-                                worksheet.set_column('E:E', 15)  # Amount
-                                
-                                # Format the amount column
-                                money_format = workbook.add_format({'num_format': 'Kshs #,##0.00'})
-                                worksheet.set_column('E:E', 15, money_format)
-                            
-                            # Create export buttons in a row
-                            col1, col2, _ = st.columns([1, 1, 3])
-                            
-                            with col1:
-                                # Excel Export Button
-                                st.download_button(
-                                    label="📊 Excel",
-                                    data=output.getvalue(),
-                                    file_name=f"expenses_export_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    help="Download all expenses as an Excel file",
-                                    use_container_width=True
-                                )
-                            
-                            with col2:
-                                # CSV Export Button
-                                csv = expenses_df.to_csv(index=False)
-                                st.download_button(
-                                    label="📝 CSV",
-                                    data=csv,
-                                    file_name=f"expenses_export_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                    mime="text/csv",
-                                    help="Download all expenses as a CSV file",
-                                    use_container_width=True
-                                )
-                    
-                        # Add search and filter functionality
-                        search_col, month_col, category_col = st.columns([3, 1, 1])
-                        
-                        with search_col:
-                            search_term = st.text_input("Search expenses", "", 
-                                                      placeholder="Search by description or category...")
-                        
-                        with month_col:
-                            # Add month filter
-                            month_list = ['All Months'] + sorted(
-                                pd.to_datetime(expenses_df['Date']).dt.strftime('%Y-%m').unique().tolist(), 
-                                reverse=True
-                            )
-                            month_filter = st.selectbox(
-                                "Filter by month",
-                                month_list,
-                                key="expense_month_filter"
-                            )
-                        
-                        with category_col:
-                            # Add category filter
-                            category_filter = st.selectbox(
-                                "Filter by category",
-                                ["All Categories"] + sorted(expenses_df['Category'].unique().tolist()),
-                                key="expense_category_filter"
-                            )
-                        
-                        # Create a filtered copy of the original data
-                        filtered_expenses = expenses_df.copy()
-                        
-                        # Apply search filter
-                        if search_term:
-                            search_mask = (filtered_expenses['Description'].str.contains(search_term, case=False, na=False)) | \
-                                         (filtered_expenses['Category'].str.contains(search_term, case=False, na=False))
-                            filtered_expenses = filtered_expenses[search_mask]
-                        
-                        # Apply month filter
-                        if month_filter != "All Months":
-                            filtered_expenses = filtered_expenses[
-                                pd.to_datetime(filtered_expenses['Date']).dt.strftime('%Y-%m') == month_filter
-                            ]
-                        
-                        # Apply category filter
-                        if category_filter != "All Categories":
-                            filtered_expenses = filtered_expenses[filtered_expenses['Category'] == category_filter]
-                        
-                        # Create display version with formatted amounts
-                        if not filtered_expenses.empty:
-                            display_expenses = filtered_expenses[['Date', 'Category', 'Description', 'Amount']].copy()
-                            display_expenses['Date'] = pd.to_datetime(display_expenses['Date']).dt.strftime('%Y-%m-%d')
-                            
-                            # Display the table with custom styling
-                            st.dataframe(
-                                display_expenses,
-                                column_config={
-                                    "Date": "Date",
-                                    "Category": "Category",
-                                    "Description": "Description",
-                                    "Amount": st.column_config.NumberColumn(
-                                        "Amount (Kshs)",
-                                        format="%.2f"
-                                    )
-                                },
-                                use_container_width=True,
-                                hide_index=True,
-                                height=400
-                            )
-                            
-                            # Add export buttons
-                            export_col1, export_col2 = st.columns(2)
-                            
-                            with export_col1:
-                                # Export to Excel
-                                output = io.BytesIO()
-                                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                                    filtered_expenses.to_excel(writer, index=False, sheet_name='Expenses')
-                                    workbook = writer.book
-                                    worksheet = writer.sheets['Expenses']
-                                    
-                                    # Format headers
-                                    header_format = workbook.add_format({
-                                        'bold': True,
-                                        'text_wrap': True,
-                                        'valign': 'top',
-                                        'fg_color': '#4CAF50',
-                                        'border': 1,
-                                        'font_color': 'white'
-                                    })
-                                    
-                                    for col_num, value in enumerate(filtered_expenses.columns.values):
-                                        worksheet.write(0, col_num, value, header_format)
-                                    
-                                    # Set column widths
-                                    worksheet.set_column('A:A', 15)  # Date
-                                    worksheet.set_column('B:B', 20)  # Category
-                                    worksheet.set_column('C:C', 15)  # Subcategory
-                                    worksheet.set_column('D:D', 40)  # Description
-                                    worksheet.set_column('E:E', 15, workbook.add_format({'num_format': 'Kshs #,##0.00'}))  # Amount
-                                
-                                st.download_button(
-                                    label="📊 Export to Excel",
-                                    data=output.getvalue(),
-                                    file_name=f"expenses_export_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    use_container_width=True
-                                )
-                            
-                            with export_col2:
-                                # Export to CSV
-                                csv = filtered_expenses.to_csv(index=False).encode('utf-8')
-                                st.download_button(
-                                    label="📝 Export to CSV",
-                                    data=csv,
-                                    file_name=f"expenses_export_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                                    mime='text/csv',
-                                    use_container_width=True
-                                )
-                        else:
-                            st.info("No expenses match the current filters.")
-                        
-                        # --- Expense Management ---
-                        st.markdown("### ⚙️ Expense Management")
-                    
-                        # Create a dropdown for selecting an expense to edit/delete
-                        expenses_df['Label'] = expenses_df.apply(
-                            lambda row: f"{row['Date'].strftime('%Y-%m-%d')} | {row['Category']} | {row['Description']} | Kshs {row['Amount']:,.2f}", 
-                            axis=1
-                        )
-                        
-                        # Use a session state to track if we should reset the selectbox
-                        if 'reset_expense_select' not in st.session_state:
-                            st.session_state.reset_expense_select = False
-                        
-                        # Create a unique key for the selectbox
-                        selectbox_key = f"expense_select_{len(expenses_df)}"
-                        
-                        # Create the selectbox
-                        selected_label = st.selectbox(
-                            "Select an expense to manage:", 
-                            ["Select an expense..."] + expenses_df['Label'].tolist(), 
-                            key=selectbox_key
-                        )
-                        
-                        # Check if we need to show the expense form
-                        show_expense_form = selected_label and selected_label != "Select an expense..."
-                        
-                        if show_expense_form and not st.session_state.reset_expense_select:
-                            matching_expenses = expenses_df[expenses_df['Label'] == selected_label]
-                            if not matching_expenses.empty:
-                                idx = matching_expenses.index[0]
-                                action_key = f'action_expense_{idx}'
-                                
-                                # Store the selected action in session state
-                                if action_key not in st.session_state:
-                                    st.session_state[action_key] = "Edit"  # Default to Edit
-                                
-                                # Use a radio button to select action
-                                action = st.radio(
-                                    "Action:", 
-                                    ["Edit", "Delete"], 
-                                    key=f'radio_{action_key}'
-                                )
-                                
-                                # Update the session state when radio changes
-                                if action != st.session_state[action_key]:
-                                    st.session_state[action_key] = action
-                                    st.rerun()
-                                
-                                if action == "Edit":
-                                    with st.form(key=f'edit_expense_form_{idx}'):
-                                        st.markdown("---")
-                                        st.subheader(f"Edit Expense #{idx+1}")
-                                        edit_date = st.date_input("Date:", value=pd.to_datetime(expenses_df.loc[idx, 'Date']).date(), key=f'edit_expense_date_{idx}')
-                                        edit_category = st.selectbox("Category:", ['Feed', 'Veterinary', 'Labor', 'Utilities', 'Equipment', 'Other'], 
-                                                                  index=['Feed', 'Veterinary', 'Labor', 'Utilities', 'Equipment', 'Other'].index(expenses_df.loc[idx, 'Category']) 
-                                                                  if expenses_df.loc[idx, 'Category'] in ['Feed', 'Veterinary', 'Labor', 'Utilities', 'Equipment', 'Other'] else 0, 
-                                                                  key=f'edit_expense_category_{idx}')
-                                        edit_description = st.text_input("Description:", value=expenses_df.loc[idx, 'Description'], key=f'edit_expense_description_{idx}')
-                                        edit_amount = st.number_input("Amount:", min_value=0.0, value=float(expenses_df.loc[idx, 'Amount']), format="%.2f", key=f'edit_expense_amount_{idx}')
-                                        
-                                        col1, col2 = st.columns([1, 1])
-                                        with col1:
-                                            submit_edit = st.form_submit_button("💾 Save Changes")
-                                        with col2:
-                                            cancel_edit = st.form_submit_button("❌ Cancel")
-                                        
-                                        if submit_edit:
-                                            st.session_state['financial_data'].at[expenses_df.index[idx], 'Date'] = edit_date
-                                            st.session_state['financial_data'].at[expenses_df.index[idx], 'Category'] = edit_category
-                                            st.session_state['financial_data'].at[expenses_df.index[idx], 'Description'] = edit_description
-                                            st.session_state['financial_data'].at[expenses_df.index[idx], 'Amount'] = edit_amount
-                                            save_financial_data(st.session_state['financial_data'])
-                                            st.success("Expense updated successfully!")
-                                            st.balloons()
-                                            st.session_state.reset_expense_select = True
-                                            st.rerun()
-                                            
-                                        if cancel_edit:
-                                            st.session_state.reset_expense_select = True
-                                            st.rerun()
-                                
-                                elif action == "Delete":
-                                    st.markdown("---")
-                                    st.subheader(f"Delete Expense #{idx+1}")
-                                    st.warning("⚠️ Are you sure you want to delete this expense? This action cannot be undone.")
-                                    
-                                    col1, col2 = st.columns(2)
-                                    
-                                    with col1:
-                                        if st.button("✅ Confirm Delete", type="primary", key=f'confirm_delete_{idx}'):
-                                            # Remove the expense from the financial data
-                                            st.session_state['financial_data'] = st.session_state['financial_data'].drop(index=idx).reset_index(drop=True)
-                                            
-                                            # Save the changes
-                                            save_financial_data(st.session_state['financial_data'])
-                                            st.success("Expense deleted successfully!")
-                                            st.balloons()
-                                            st.session_state.reset_expense_select = True
-                                            st.rerun()
-                                    
-                                    with col2:
-                                        if st.button("❌ Cancel", key=f'cancel_delete_{idx}'):
-                                            st.session_state.reset_expense_select = True
-                                            st.rerun()
-                        
-                        # Reset the flag after handling the rerun
-                        if st.session_state.reset_expense_select:
-                            st.session_state.reset_expense_select = False
-                            st.rerun()
-                    else:
-                        st.info("No expenses recorded yet.")
-            else:
-                st.info("No financial data available yet.")
+                    st.download_button(
+                        label="📊 Download Excel",
+                        data=buffer.getvalue(),
+                        file_name=f"expenses_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+        else:
+            st.info("📝 No expenses recorded yet. Add your first expense above!")
+        
+        # Check if data refresh is needed after form submission (outside all form blocks)
+        if st.session_state.get('data_refresh_needed', False):
+            # Clear specific cache entries instead of all caches
+            if supabase:
+                # Only clear financial data cache, not all caches
+                load_financial_data.clear()
+                load_financial_data_from_db.clear()
+            
+            # Refresh data from database to get latest changes
+            st.session_state['financial_data'] = load_financial_data()
+            
+            st.session_state['data_refresh_needed'] = False
+            st.session_state['financials_tab_clicked'] = st.session_state.get('financials_tab_clicked', 0)  # Stay on current tab
+            st.rerun()
+        
         with subtab_budgets:
             if not can_edit_financials:
                 st.info("You do not have permission to manage budgets. Viewing only.")
@@ -5329,7 +5605,7 @@ def main():
                         # Force refresh of budget data from CSV to ensure consistency
                         st.session_state['budgets'] = load_budgets_data()
                         st.success("Budget saved successfully!")
-                        st.rerun()
+                        st.session_state['data_refresh_needed'] = True
             with st.expander("Edit or Delete Existing Budgets"):
                 if not budgets_df.empty:
                     budgets_df = budgets_df.reset_index(drop=True)
@@ -5344,13 +5620,13 @@ def main():
                                 budgets_df.at[idx, 'Budget'] = edit_amount
                                 st.session_state['budgets'] = budgets_df.drop(columns=['Label'])
                                 st.success("Budget updated!")
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
                         with col2:
                             if st.button("Delete Budget", key='delete_budget_btn'):
                                 budgets_df = budgets_df.drop(idx).drop(columns=['Label'])
                                 st.session_state['budgets'] = budgets_df
                                 st.success("Budget deleted!")
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
                 else:
                     st.info("No budgets to edit or delete.")
 
@@ -5404,11 +5680,11 @@ def main():
                         'Category': rec_category,
                         'Amount': rec_amount,
                         'Frequency': rec_frequency,
-                        'Start Date': rec_start_date,
+                        'Start Date': rec_start_date.strftime('%Y-%m-%d') if hasattr(rec_start_date, 'strftime') else str(rec_start_date),
                         'Description': rec_description
                     })
                     st.success("Recurring expense added!")
-                    st.rerun()
+                    st.session_state['data_refresh_needed'] = True
             if st.session_state['recurring_expenses']:
                 st.markdown("**Your Recurring Expenses:**")
                 for idx, rec in enumerate(st.session_state['recurring_expenses']):
@@ -5594,7 +5870,7 @@ def main():
                                 }
                                 st.session_state['categories'] = categories_dict
                                 st.success(f"✅ Category '{new_cat}' added successfully!")
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
                             else:
                                 st.error("A category with this name already exists.")
                         else:
@@ -5659,7 +5935,7 @@ def main():
                                         categories_dict[selected_category]['subcategories'] = subcategories
                                         st.session_state['categories'] = categories_dict
                                         st.success(f"✅ Subcategory '{new_subcat}' added to '{selected_category}'!")
-                                        st.rerun()
+                                        st.session_state['data_refresh_needed'] = True
                                 else:
                                     st.warning("Please enter a subcategory name")
 
@@ -5734,13 +6010,13 @@ def main():
                                         st.success(f"✅ Category renamed to '{new_name}'")
                                         st.session_state['edit_category_select'] = new_name
                                         st.session_state['categories'] = categories_dict
-                                        st.rerun()
+                                        st.session_state['data_refresh_needed'] = True
                                     else:
                                         # Just update color if name didn't change
                                         categories_dict[edit_category]['color'] = new_color
                                         st.success("✅ Category updated successfully!")
                                         st.session_state['categories'] = categories_dict
-                                        st.rerun()
+                                        st.session_state['data_refresh_needed'] = True
                             
                             with col_del:
                                 if edit_category in default_categories:
@@ -5755,7 +6031,7 @@ def main():
                                                    type="secondary",
                                                    use_container_width=True):
                                             st.session_state['confirm_delete'] = edit_category
-                                            st.rerun()
+                                            st.session_state['data_refresh_needed'] = True
                                     else:
                                         if st.button("⚠️ Confirm Deletion", 
                                                    key=f"confirm_del_{edit_category}",
@@ -5767,14 +6043,14 @@ def main():
                                             st.session_state['categories'] = categories_dict
                                             st.session_state['edit_category_select'] = "Select a category..."
                                             st.success(f"✅ Category '{edit_category}' deleted successfully!")
-                                            st.rerun()
+                                            st.session_state['data_refresh_needed'] = True
                             
                             if st.session_state.get('confirm_delete') == edit_category:
                                 if st.button("❌ Cancel", 
                                            key=f"cancel_delete_{edit_category}",
                                            use_container_width=True):
                                     del st.session_state['confirm_delete']
-                                    st.rerun()
+                                    st.session_state['data_refresh_needed'] = True
                             
                             # Subcategories section
                             st.markdown("---")
@@ -5830,7 +6106,7 @@ def main():
                                                 current_info['subcategories'].pop(i)
                                                 st.session_state['categories'] = categories_dict
                                                 st.success("✅ Subcategory deleted successfully!")
-                                                st.rerun()
+                                                st.session_state['data_refresh_needed'] = True
                                             else:
                                                 st.warning("A category must have at least one subcategory")
                                     
@@ -5845,7 +6121,7 @@ def main():
                                                 'color': new_sub_color
                                             }
                                         st.session_state['categories'] = categories_dict
-                                        st.rerun()
+                                        st.session_state['data_refresh_needed'] = True
                                     
                                     st.markdown("</div>", unsafe_allow_html=True)
                             
@@ -5865,7 +6141,7 @@ def main():
                                     'color': new_color
                                 })
                                 st.session_state['categories'] = categories_dict
-                                st.rerun()
+                                st.session_state['data_refresh_needed'] = True
             
             # Display current categories in a card view at the bottom
             st.markdown("---")
@@ -5999,28 +6275,121 @@ def main():
             # Key Metrics
             st.markdown("### 📊 Key Metrics")
 
+            # Custom CSS for larger, non-truncated metrics
+            st.markdown("""
+            <style>
+            .custom-metric {
+                background: #f8f9fa;
+                border: 1px solid #e9ecef;
+                border-radius: 8px;
+                padding: 1.2rem;
+                margin-bottom: 1rem;
+                text-align: center;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            }
+            .custom-metric-label {
+                font-size: 1rem;
+                font-weight: 600;
+                color: #495057;
+                margin-bottom: 0.5rem;
+            }
+            .custom-metric-value {
+                font-size: 1.4rem;
+                font-weight: 700;
+                color: #212529;
+                line-height: 1.2;
+                white-space: nowrap;
+                overflow: visible;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+
             # Row 1: Expenses, Revenue, ROI
             row1_col1, row1_col2, row1_col3 = st.columns(3)
             with row1_col1:
-                st.metric("Total Expenses", format_number(total_expenses, 2, True))
+                st.markdown(f"""
+                <div class="custom-metric">
+                    <div class="custom-metric-label">Total Expenses</div>
+                    <div class="custom-metric-value">Kshs {total_expenses:,.2f}</div>
+                </div>
+                """, unsafe_allow_html=True)
             with row1_col2:
-                st.metric("Total Revenue", format_number(total_revenue, 2, True))
+                st.markdown(f"""
+                <div class="custom-metric">
+                    <div class="custom-metric-label">Total Revenue</div>
+                    <div class="custom-metric-value">Kshs {total_revenue:,.2f}</div>
+                </div>
+                """, unsafe_allow_html=True)
             with row1_col3:
                 if total_expenses > 0:
-                    st.metric("ROI", f"{roi:.1f}%")
+                    st.markdown(f"""
+                    <div class="custom-metric">
+                        <div class="custom-metric-label">ROI</div>
+                        <div class="custom-metric-value">{roi:.1f}%</div>
+                    </div>
+                    """, unsafe_allow_html=True)
                 else:
                     st.info("Add expenses to calculate ROI.")
 
             # Row 2: Number of Hogs, Cost per Hog, Expense per kg Gain, Total Weight Gain
             row2_col1, row2_col2, row2_col3, row2_col4 = st.columns(4)
             with row2_col1:
-                st.metric("Number of Hogs", num_hogs)
+                st.markdown(f"""
+                <div class="custom-metric">
+                    <div class="custom-metric-label">Number of Hogs</div>
+                    <div class="custom-metric-value">{num_hogs:,}</div>
+                </div>
+                """, unsafe_allow_html=True)
             with row2_col2:
-                st.metric("Cost per Hog", format_number(cost_per_hog, 2, True))
+                st.markdown(f"""
+                <div class="custom-metric">
+                    <div class="custom-metric-label">Cost per Hog</div>
+                    <div class="custom-metric-value">Kshs {cost_per_hog:,.2f}</div>
+                </div>
+                """, unsafe_allow_html=True)
             with row2_col3:
-                st.metric("Expense per kg Gain", format_number(expense_per_kg_gain, 2, True))
+                st.markdown(f"""
+                <div class="custom-metric">
+                    <div class="custom-metric-label">Expense per kg Gain</div>
+                    <div class="custom-metric-value">Kshs {expense_per_kg_gain:,.2f}</div>
+                </div>
+                """, unsafe_allow_html=True)
             with row2_col4:
-                st.metric("Total Weight Gain", f"{total_gain:,.2f} kg")
+                st.markdown(f"""
+                <div class="custom-metric">
+                    <div class="custom-metric-label">Total Weight Gain</div>
+                    <div class="custom-metric-value">{total_gain:,.2f} kg</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Row 3: Sales Metrics
+            if not sales_df.empty:
+                total_sales = sales_df['Amount'].sum()
+                average_sales = sales_df['Amount'].mean()
+                total_sales_records = len(sales_df)
+                
+                row3_col1, row3_col2, row3_col3 = st.columns(3)
+                with row3_col1:
+                    st.markdown(f"""
+                    <div class="custom-metric">
+                        <div class="custom-metric-label">💰 Total Sales</div>
+                        <div class="custom-metric-value">Kshs {total_sales:,.2f}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with row3_col2:
+                    st.markdown(f"""
+                    <div class="custom-metric">
+                        <div class="custom-metric-label">📊 Average Sales</div>
+                        <div class="custom-metric-value">Kshs {average_sales:,.2f}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with row3_col3:
+                    st.markdown(f"""
+                    <div class="custom-metric">
+                        <div class="custom-metric-label">📈 Total Sales Records</div>
+                        <div class="custom-metric-value">{total_sales_records:,}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
             st.markdown("---")
             # Expense Category Breakdown
@@ -6047,7 +6416,7 @@ def main():
                         color_discrete_sequence=px.colors.qualitative.Set3
                     )
                     fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-                    st.plotly_chart(fig_pie, use_container_width=True)
+                    st.plotly_chart(fig_pie, use_container_width=True, key="chart_18")
 
                 # Monthly Expense Trends
                 st.markdown("### 📅 Monthly Expense Trends")
@@ -6064,7 +6433,6 @@ def main():
                     labels={'Amount': 'Total Amount (Kshs)', 'Month': 'Month'}
                 )
                 fig_line.update_traces(hovertemplate='Month: %{x}<br>Total: Kshs %{y:,.2f}')
-                st.plotly_chart(fig_line, use_container_width=True)
 
             st.markdown("---")
             st.info("- Cost per hog: Total expenses divided by number of hogs.\n- Expense per kg gain: Total expenses divided by total weight gain.\n- ROI: (Revenue - Expenses) / Expenses × 100% (requires sales data).\n- For best accuracy, keep hog and expense records up to date.")
@@ -6072,6 +6440,22 @@ def main():
             # Sales Trends
             if not sales_df.empty:
                 st.markdown("### 💰 Sales Trends")
+                
+                # Sales Metrics
+                total_sales = sales_df['Amount'].sum()
+                average_sales = sales_df['Amount'].mean()
+                total_sales_records = len(sales_df)
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("💰 Total Sales", f"Kshs {total_sales:,.2f}")
+                with col2:
+                    st.metric("📊 Average Sales", f"Kshs {average_sales:,.2f}")
+                with col3:
+                    st.metric("📈 Total Sales Records", total_sales_records)
+                
+                st.markdown("---")
+                
                 sales_df['Date'] = pd.to_datetime(sales_df['Date'])
                 sales_df['Month'] = sales_df['Date'].dt.to_period('M')
                 monthly_sales = sales_df.groupby('Month')['Amount'].sum().reset_index()
@@ -6085,7 +6469,7 @@ def main():
                     labels={'Amount': 'Total Sales (Kshs)', 'Month': 'Month'}
                 )
                 fig_sales.update_traces(hovertemplate='Month: %{x}<br>Total: Kshs %{y:,.2f}')
-                st.plotly_chart(fig_sales, use_container_width=True)
+                st.plotly_chart(fig_sales, use_container_width=True, key="chart_20")
 
             st.markdown("---")
             st.info("- Cost per hog: Total expenses divided by number of hogs.\n- Expense per kg gain: Total expenses divided by total weight gain.\n- ROI: (Revenue - Expenses) / Expenses × 100% (requires sales data).\n- For best accuracy, keep hog and expense records up to date.")
@@ -6154,17 +6538,29 @@ def main():
                                 help="Price per kilogram"
                             )
                         
-                        # Auto-calculate total amount
+                        # Auto-calculate total amount with real-time display
                         calculated_amount = sale_weight * price_per_kg if sale_weight and price_per_kg else 0.0
-                        sale_amount = st.number_input(
-                            "💵 Total Sale Amount (Kshs)",
-                            min_value=0.0,
-                            step=100.0,
-                            format="%.2f",
-                            value=calculated_amount,
-                            key='sale_amount',
-                            help="This will auto-calculate but can be adjusted if needed"
-                        )
+                        
+                        # Show real-time calculation result
+                        if sale_weight > 0 and price_per_kg > 0:
+                            st.markdown(f"""
+                            <div style='background-color:#e8f5e8;padding:12px;border-radius:8px;margin-bottom:15px;border-left:4px solid #4caf50;'>
+                                <div style='color:#2e7d32;font-size:16px;font-weight:600;'>
+                                    💵 <strong>Total Sale Amount (Kshs)</strong>
+                                </div>
+                                <div style='color:#1b5e20;font-size:14px;margin-top:5px;'>
+                                    {sale_weight:.1f} kg × Kshs {price_per_kg:.2f}/kg = <strong style='color:#2e7d32;font-size:18px;'>Kshs {calculated_amount:,.2f}</strong>
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        elif sale_weight > 0 or price_per_kg > 0:
+                            st.markdown(f"""
+                            <div style='background-color:#fff3cd;padding:12px;border-radius:8px;margin-bottom:15px;border-left:4px solid #ffc107;'>
+                                <div style='color:#856404;font-size:14px;'>
+                                    ⚠️ Enter both weight and price to see calculation
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
                     
                     with col2:
                         st.markdown("### ℹ️ Additional Information")
@@ -6198,35 +6594,44 @@ def main():
                     
                     # Form submission handling
                     if submit_sale:
-                        if sale_date and hog_ids and sale_weight > 0 and price_per_kg > 0 and sale_amount > 0:
-                            with st.spinner('Saving sale record...'):
-                                new_sale = pd.DataFrame([{
-                                    'Date': sale_date,
-                                    'Type': 'Sale',
-                                    'Category': 'Sale',
-                                    'Description': f"Sold hog(s): {', '.join(hog_ids)}. {sale_notes}",
-                                    'Hog ID': ','.join(hog_ids),
-                                    'Weight (kg)': sale_weight,
-                                    'Price/kg': price_per_kg,
-                                    'Amount': sale_amount,
-                                    'Buyer': buyer
-                                }])
-                                
-                                # Ensure all required columns exist
-                                for col in ['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer']:
-                                    if col not in st.session_state['financial_data'].columns:
-                                        st.session_state['financial_data'][col] = pd.NA
-                                
-                                # Add new sale and save
-                                st.session_state['financial_data'] = pd.concat([st.session_state['financial_data'], new_sale], ignore_index=True)
-                                save_financial_data(st.session_state['financial_data'])
-                                
-                                # Force refresh of financial data from CSV to ensure consistency
-                                st.session_state['financial_data'] = load_financial_data()
-                                
-                                # Show success message
-                                st.toast('✅ Sale record added successfully!', icon='✅')
-                                st.rerun()
+                        # Check if all required fields are filled and valid
+                        if sale_date and hog_ids and len(hog_ids) > 0 and sale_weight > 0 and price_per_kg > 0:
+                            # Calculate amount again to ensure we have the latest values
+                            calculated_amount = sale_weight * price_per_kg
+                            
+                            # Only proceed if we have a valid calculated amount
+                            if calculated_amount > 0:
+                                with st.spinner('Saving sale record...'):
+                                    new_sale = pd.DataFrame([{
+                                        'Date': sale_date.strftime('%Y-%m-%d') if hasattr(sale_date, 'strftime') else str(sale_date),
+                                        'Type': 'Sale',
+                                        'Category': 'Sale',
+                                        'Description': f"Sold hog(s): {', '.join(hog_ids)}. {sale_notes}",
+                                        'Hog ID': ','.join(hog_ids),
+                                        'Weight (kg)': sale_weight,
+                                        'Price/kg': price_per_kg,
+                                        'Amount': calculated_amount,
+                                        'Buyer': buyer if buyer and buyer.strip() else None
+                                    }])
+                                    
+                                    # Ensure all required columns exist
+                                    for col in ['Date', 'Type', 'Category', 'Description', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer']:
+                                        if col not in st.session_state['financial_data'].columns:
+                                            st.session_state['financial_data'][col] = pd.NA
+                                    
+                                    # Add new sale and save
+                                    st.session_state['financial_data'] = pd.concat([st.session_state['financial_data'], new_sale], ignore_index=True)
+                                    # Save to database first
+                                    save_financial_data(st.session_state['financial_data'])
+                                    
+                                    # Force complete data refresh from database to ensure consistency
+                                    st.session_state['financial_data'] = load_financial_data()
+                                    
+                                    # Show success message
+                                    st.toast('✅ Sale record saved successfully!', icon='✅')
+                                    st.session_state['data_refresh_needed'] = True
+                            else:
+                                st.error("❌ Please fill in all required fields with valid values (weight and price must be greater than 0).")
                         else:
                             st.error("❌ Please fill in all required fields and ensure values are greater than zero.")
             sales_df = st.session_state['financial_data'][st.session_state['financial_data']['Type'] == 'Sale'].copy() if not st.session_state['financial_data'].empty else pd.DataFrame()
@@ -6234,11 +6639,168 @@ def main():
             if not sales_df.empty:
                 st.subheader("All Sales Records")
                 
-                # Format and display sales records
+                # Add dropdown selector like expenses section
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    # Create readable sales options
+                    sales_options = {}
+                    for idx, row in sales_df.iterrows():
+                        date_str = row['Date'].strftime('%Y-%m-%d') if hasattr(row['Date'], 'strftime') else str(row['Date'])
+                        hog_id = str(row['Hog ID']) if pd.notna(row['Hog ID']) else 'No ID'
+                        weight = f"{row['Weight (kg)']:.1f}kg" if pd.notna(row['Weight (kg)']) else '0kg'
+                        amount = f"Kshs {row['Amount']:,.2f}" if pd.notna(row['Amount']) else 'Kshs 0'
+                        label = f"{date_str} | {hog_id} | {weight} | {amount}"
+                        sales_options[label] = idx
+                    
+                    selected_sale = st.selectbox(
+                        "Select sale to edit or delete:",
+                        options=["Select a sale..."] + list(sales_options.keys()),
+                        key="simple_sale_select"
+                    )
+                
+                with col2:
+                    if selected_sale != "Select a sale...":
+                        st.markdown("**Actions:**")
+                        if st.button("✏️ Edit", key="edit_sale_btn", use_container_width=True):
+                            st.session_state['sale_edit_mode'] = True
+                            st.session_state['sale_delete_mode'] = False
+                            st.session_state['selected_sale_idx'] = sales_options[selected_sale]
+                            st.session_state['financials_tab_clicked'] = 1  # Stay on Sales tab
+                            st.rerun()
+                        
+                        if st.button("🗑️ Delete", key="delete_sale_btn", use_container_width=True):
+                            st.session_state['sale_delete_mode'] = True
+                            st.session_state['sale_edit_mode'] = False
+                            st.session_state['selected_sale_idx'] = sales_options[selected_sale]
+                            st.session_state['financials_tab_clicked'] = 1  # Stay on Sales tab
+                            st.rerun()
+                
+                # Edit Form
+                if st.session_state.get('sale_edit_mode', False) and 'selected_sale_idx' in st.session_state:
+                    idx = st.session_state['selected_sale_idx']
+                    sale = sales_df.loc[idx]
+                    
+                    st.markdown("---")
+                    st.markdown("#### ✏️ Edit Sale Record")
+                    
+                    with st.form(key="edit_sale_form"):
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            edit_date = st.date_input("Date", value=pd.to_datetime(sale['Date']).date())
+                            edit_hog_id = st.text_input("Hog ID", value=str(sale['Hog ID']) if pd.notna(sale['Hog ID']) else '')
+                            edit_weight = st.number_input("Weight (kg)", min_value=0.0, value=float(sale['Weight (kg)']), format="%.1f")
+                        
+                        with col2:
+                            edit_price = st.number_input("Price/kg (Kshs)", min_value=0.0, value=float(sale['Price/kg']), format="%.2f")
+                            edit_buyer = st.text_input("Buyer", value=str(sale['Buyer']) if pd.notna(sale['Buyer']) else '')
+                            edit_amount = edit_weight * edit_price
+                            st.info(f"💰 Total Amount: Kshs {edit_amount:,.2f}")
+                        
+                        edit_description = st.text_area("Description", value=str(sale['Description']) if pd.notna(sale['Description']) else '')
+                        
+                        col_save, col_cancel = st.columns(2)
+                        with col_save:
+                            submit_edit = st.form_submit_button("💾 Save Changes", use_container_width=True)
+                        
+                        with col_cancel:
+                            cancel_edit = st.form_submit_button("❌ Cancel", use_container_width=True)
+                        
+                        if submit_edit:
+                            # Update the record
+                            st.session_state['financial_data'].at[idx, 'Date'] = edit_date.strftime('%Y-%m-%d')
+                            st.session_state['financial_data'].at[idx, 'Hog ID'] = edit_hog_id
+                            st.session_state['financial_data'].at[idx, 'Weight (kg)'] = edit_weight
+                            st.session_state['financial_data'].at[idx, 'Price/kg'] = edit_price
+                            st.session_state['financial_data'].at[idx, 'Amount'] = edit_amount
+                            st.session_state['financial_data'].at[idx, 'Buyer'] = edit_buyer if edit_buyer else None
+                            st.session_state['financial_data'].at[idx, 'Description'] = edit_description
+                            
+                            save_financial_data(st.session_state['financial_data'])
+                            st.success("✅ Sale record updated successfully!")
+                            st.session_state['sale_edit_mode'] = False
+                            st.session_state['data_refresh_needed'] = True
+                            st.session_state['financials_tab_clicked'] = 1  # Stay on Sales tab
+                            st.rerun()
+                        
+                        if cancel_edit:
+                            st.session_state['sale_edit_mode'] = False
+                            st.session_state['financials_tab_clicked'] = 1  # Stay on Sales tab
+                            st.rerun()
+                
+                # Delete Confirmation
+                if st.session_state.get('sale_delete_mode', False) and 'selected_sale_idx' in st.session_state:
+                    idx = st.session_state['selected_sale_idx']
+                    sale = sales_df.loc[idx]
+                    
+                    st.markdown("---")
+                    st.markdown("#### 🗑️ Delete Sale Record")
+                    st.warning(f"Are you sure you want to delete this sale record?")
+                    
+                    # Show sale details
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Date", sale['Date'].strftime('%Y-%m-%d') if hasattr(sale['Date'], 'strftime') else str(sale['Date']))
+                    with col2:
+                        st.metric("Hog ID", str(sale['Hog ID']) if pd.notna(sale['Hog ID']) else 'No ID')
+                    with col3:
+                        st.metric("Amount", f"Kshs {sale['Amount']:,.2f}" if pd.notna(sale['Amount']) else 'Kshs 0')
+                    
+                    col_weight, col_price, col_buyer = st.columns(3)
+                    with col_weight:
+                        st.metric("Weight", f"{sale['Weight (kg)']:.1f}kg" if pd.notna(sale['Weight (kg)']) else '0kg')
+                    with col_price:
+                        st.metric("Price/kg", f"Kshs {sale['Price/kg']:.2f}" if pd.notna(sale['Price/kg']) else 'Kshs 0')
+                    with col_buyer:
+                        st.metric("Buyer", str(sale['Buyer']) if pd.notna(sale['Buyer']) else 'No buyer')
+                    
+                    if pd.notna(sale['Description']):
+                        st.write(f"**Description:** {sale['Description']}")
+                    
+                    col_confirm, col_cancel = st.columns(2)
+                    
+                    with col_confirm:
+                        if st.button("🗑️ Confirm Delete", key="confirm_delete_sale_btn", use_container_width=True):
+                            # Get the database ID if available (for Supabase records)
+                            db_id = sale.get('id') if 'id' in sale and pd.notna(sale['id']) else None
+                            
+                            # Delete from Supabase if we have the ID
+                            if db_id and supabase:
+                                try:
+                                    supabase.table('financial_transactions').delete().eq('id', db_id).execute()
+                                    st.info("🗄️ Deleted from Supabase database")
+                                except Exception as e:
+                                    st.error(f"❌ Failed to delete from Supabase: {str(e)}")
+                                    st.warning("🔄 Deleting from local data only...")
+                            
+                            # Delete from local session state
+                            st.session_state['financial_data'] = st.session_state['financial_data'].drop(idx).reset_index(drop=True)
+                            save_financial_data(st.session_state['financial_data'])
+                            # Clear cache and force data refresh to ensure display consistency
+                            load_financial_data.clear()
+                            st.session_state['financial_data'] = load_financial_data()
+                            # Refresh sales_df to update dropdown and display
+                            sales_df = st.session_state['financial_data'][st.session_state['financial_data']['Type'] == 'Sale'].copy() if not st.session_state['financial_data'].empty else pd.DataFrame()
+                            st.success("✅ Sale record deleted successfully!")
+                            st.session_state['sale_delete_mode'] = False
+                            st.session_state['data_refresh_needed'] = True
+                            st.session_state['financials_tab_clicked'] = 1  # Stay on Sales tab
+                            st.rerun()
+                    
+                    with col_cancel:
+                        if st.button("❌ Cancel", key="cancel_delete_sale_btn", use_container_width=True):
+                            st.session_state['sale_delete_mode'] = False
+                            st.session_state['financials_tab_clicked'] = 1  # Stay on Sales tab
+                            st.rerun()
+                
+                st.markdown("---")
+                st.subheader("Sales Records Table")
+                
+                # Format and display sales records table
                 sales_display = sales_df[['Date', 'Hog ID', 'Weight (kg)', 'Price/kg', 'Amount', 'Buyer', 'Description']].copy()
                 sales_display['Date'] = pd.to_datetime(sales_display['Date']).dt.strftime('%d/%m/%Y')
                 
-                # Display with proper formatting
                 st.dataframe(
                     sales_display,
                     column_config={
@@ -6263,156 +6825,6 @@ def main():
                     hide_index=True
                 )
                 
-                # Add edit/delete section
-                st.markdown("### ✏️ Edit or Delete Sale Record")
-                
-                # Create a list of sale records for selection
-                sales_df['sale_label'] = sales_df.apply(
-                    lambda row: f"{row['Date'].strftime('%Y-%m-%d')} | Hog(s): {row['Hog ID']} | {row['Weight (kg)']}kg @ Kshs {row['Price/kg']:,.2f}/kg | Total: Kshs {row['Amount']:,.2f}", 
-                    axis=1
-                )
-                
-                # Initialize session state for sale edit if not exists
-                if 'sale_edit_select' not in st.session_state:
-                    st.session_state.sale_edit_select = "Select a sale..."
-                
-                # Create a mapping of display labels to indices
-                sale_options = ["Select a sale..."] + sales_df['sale_label'].tolist()
-                
-                # Display the selectbox with the current session state
-                selected_sale = st.selectbox(
-                    "Select a sale record to edit or delete:",
-                    sale_options,
-                    index=sale_options.index(st.session_state.sale_edit_select) if st.session_state.sale_edit_select in sale_options else 0,
-                    key="sale_edit_select_widget"
-                )
-                
-                # Update the session state with the current selection
-                st.session_state.sale_edit_select = selected_sale
-                
-                if selected_sale and selected_sale != "Select a sale...":
-                    # Find the selected sale
-                    sale_idx = sales_df[sales_df['sale_label'] == selected_sale].index[0]
-                    sale_data = sales_df.loc[sale_idx]
-                    
-                    # Action selection
-                    action = st.radio(
-                        "Action:",
-                        ["Edit", "Delete"],
-                        key=f"sale_action_{sale_idx}",
-                        horizontal=True
-                    )
-                    
-                    if action == "Edit":
-                        with st.form(key=f'edit_sale_form_{sale_idx}'):
-                            st.write("### ✏️ Edit Sale Record")
-                            
-                            # Pre-fill form with existing data
-                            edit_date = st.date_input(
-                                "Sale Date:",
-                                value=pd.to_datetime(sale_data['Date']).date(),
-                                key=f'edit_sale_date_{sale_idx}'
-                            )
-                            
-                            # Parse hog IDs from the description
-                            hog_id_text = sale_data['Description'].split(':')[1].split('.')[0].strip()
-                            hog_ids = [id.strip() for id in hog_id_text.split(',')]
-                            
-                            edit_hog_ids = st.multiselect(
-                                "Hog ID(s) Sold:",
-                                [f'{int(hid):03d}' for hid in st.session_state['hog_data']['Hog ID'].unique() if pd.notna(hid)],
-                                default=hog_ids,
-                                key=f'edit_sale_hog_ids_{sale_idx}'
-                            )
-                            
-                            edit_weight = st.number_input(
-                                "Total Weight Sold (kg):",
-                                min_value=0.0,
-                                value=float(sale_data['Weight (kg)']),
-                                format="%.2f",
-                                key=f'edit_sale_weight_{sale_idx}'
-                            )
-                            
-                            edit_price_per_kg = st.number_input(
-                                "Price per kg (Kshs):",
-                                min_value=0.0,
-                                value=float(sale_data['Price/kg']),
-                                format="%.2f",
-                                key=f'edit_sale_price_per_kg_{sale_idx}'
-                            )
-                            
-                            edit_amount = st.number_input(
-                                "Total Sale Amount (Kshs):",
-                                min_value=0.0,
-                                value=float(sale_data['Amount']),
-                                format="%.2f",
-                                key=f'edit_sale_amount_{sale_idx}'
-                            )
-                            
-                            edit_buyer = st.text_input(
-                                "Buyer (optional):",
-                                value=sale_data.get('Buyer', ''),
-                                key=f'edit_sale_buyer_{sale_idx}'
-                            )
-                            
-                            # Extract notes from description
-                            notes = sale_data['Description'].split('.', 1)[1].strip() if '.' in sale_data['Description'] else ''
-                            edit_notes = st.text_input(
-                                "Notes (optional):",
-                                value=notes,
-                                key=f'edit_sale_notes_{sale_idx}'
-                            )
-                            
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                if st.form_submit_button("💾 Save Changes"):
-                                    if edit_date and edit_hog_ids and edit_weight > 0 and edit_price_per_kg > 0 and edit_amount > 0:
-                                        # Update the sale record
-                                        st.session_state['financial_data'].at[sale_idx, 'Date'] = edit_date
-                                        st.session_state['financial_data'].at[sale_idx, 'Hog ID'] = ','.join(edit_hog_ids)
-                                        st.session_state['financial_data'].at[sale_idx, 'Weight (kg)'] = edit_weight
-                                        st.session_state['financial_data'].at[sale_idx, 'Price/kg'] = edit_price_per_kg
-                                        st.session_state['financial_data'].at[sale_idx, 'Amount'] = edit_amount
-                                        st.session_state['financial_data'].at[sale_idx, 'Buyer'] = edit_buyer
-                                        st.session_state['financial_data'].at[sale_idx, 'Description'] = f"Sold hog(s): {', '.join(edit_hog_ids)}. {edit_notes}"
-                                        
-                                        save_financial_data(st.session_state['financial_data'])
-                                        st.success("Sale record updated successfully!")
-                                        st.balloons()
-                                        st.rerun()
-                                    else:
-                                        st.error("Please fill in all required fields with valid values.")
-                            
-                            with col2:
-                                if st.form_submit_button("❌ Cancel"):
-                                    if 'sale_edit_select' in st.session_state:
-                                        del st.session_state.sale_edit_select
-                                    st.rerun()
-                    
-                    elif action == "Delete":
-                        st.warning("⚠️ Are you sure you want to delete this sale record? This action cannot be undone.")
-                        
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            if st.button("✅ Confirm Delete", key=f'confirm_delete_sale_{sale_idx}'):
-                                # Remove the sale record
-                                st.session_state['financial_data'] = st.session_state['financial_data'].drop(index=sale_idx).reset_index(drop=True)
-                                
-                                # Save the changes
-                                save_financial_data(st.session_state['financial_data'])
-                                st.success("Sale record deleted successfully!")
-                                st.balloons()
-                                if 'sale_edit_select' in st.session_state:
-                                    del st.session_state.sale_edit_select
-                                st.rerun()
-                        
-                        with col2:
-                            if st.button("❌ Cancel", key=f'cancel_delete_sale_{sale_idx}'):
-                                if 'sale_edit_select' in st.session_state:
-                                    del st.session_state.sale_edit_select
-                                st.rerun()
             else:
                 st.info("No sales records yet. Add sales above.")
 

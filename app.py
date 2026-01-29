@@ -984,6 +984,12 @@ def load_financial_data():
                 if not csv_df.empty:
                     # st.info("🔄 Checking for additional CSV data to merge...")  # Debug - hidden
                     merge_csv_to_supabase("data_loading_check")
+                    # Clean up CSV after data loading check to prevent re-syncing
+                    if os.path.exists(FINANCIAL_DATA_FILE):
+                        csv_data = pd.read_csv(FINANCIAL_DATA_FILE)
+                        if not csv_data.empty:
+                            st.info("🧹 Cleaning up CSV after data sync to prevent re-syncing...")
+                            backup_and_clear_csv()
                     # Reload from Supabase to get merged data
                     db_data = load_financial_data_from_db()
                     if not db_data.empty:

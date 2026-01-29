@@ -799,14 +799,18 @@ def merge_csv_to_supabase(call_reason="unknown"):
                 st.session_state['processed_csv_records'].update(processed_ids)
                 
                 # Clean up CSV after successful merge for auto_sync calls
-                if call_reason == "auto_sync" and len(new_records) > 0:
-                    st.info("🧹 Cleaning up CSV after successful sync to Supabase...")
+                # Also clean up if all records are duplicates (they're already in Supabase)
+                if call_reason == "auto_sync" and (len(new_records) > 0 or duplicates_found > 0):
+                    st.info("🧹 Cleaning up CSV after sync to Supabase (records already exist)...")
                     backup_and_clear_csv()
                 
                 # st.success(f"✅ Successfully merged {len(new_records)} new records to Supabase!")  # Debug - hidden
             else:
                 if duplicates_found > 0:
-                    st.info(f"🔍 Skipped {duplicates_found} duplicate records that already exist in Supabase")
+                    # Clean up CSV for auto_sync calls when all records are duplicates
+                    if call_reason == "auto_sync":
+                        st.info("🧹 Cleaning up CSV after sync to Supabase (records already exist)...")
+                        backup_and_clear_csv()
                 else:
                     st.info("📊 No new records found in CSV to merge")
                     pass

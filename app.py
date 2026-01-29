@@ -717,20 +717,23 @@ def merge_csv_to_supabase():
             duplicates_found = len(csv_df) - len(new_records)
             
             if not new_records.empty:
-                st.info(f"🔄 Found {len(new_records)} new records in CSV to add to Supabase...")
+                # st.info(f"🔄 Found {len(new_records)} new records in CSV to add to Supabase...")  # Debug - hidden
                 if duplicates_found > 0:
-                    st.info(f"🔍 Skipped {duplicates_found} duplicate records that already exist in Supabase")
+                    # st.info(f"🔍 Skipped {duplicates_found} duplicate records that already exist in Supabase")  # Debug - hidden
                 
                 # Show what records are being added
                 for idx, row in new_records.iterrows():
-                    st.write(f"➕ Adding: {row['Date']} | {row['Type']} | {row['Description']} | {row['Amount']}")
+                    # st.write(f"➕ Adding: {row['Date']} | {row['Type']} | {row['Description']} | {row['Amount']}")  # Debug - hidden
                     save_financial_transaction_to_db(row.to_dict())
                 
-                st.success(f"✅ Successfully merged {len(new_records)} new records to Supabase!")
+                # st.success(f"✅ Successfully merged {len(new_records)} new records to Supabase!")  # Debug - hidden
             else:
                 if duplicates_found > 0:
-                    pass
+                    st.info(f"📊 No new records found in CSV. {duplicates_found} records already exist in Supabase.")
                 else:
+                    st.info("📊 No new records found in CSV.")
+        
+        return True
                     pass
             
             return True

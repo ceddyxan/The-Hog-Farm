@@ -723,20 +723,16 @@ def merge_csv_to_supabase():
                 
                 # Show what records are being added
                 for idx, row in new_records.iterrows():
-                    # st.write(f"➕ Adding: {row['Date']} | {row['Type']} | {row['Description']} | {row['Amount']}")  # Debug - hidden
                     save_financial_transaction_to_db(row.to_dict())
                 
                 # st.success(f"✅ Successfully merged {len(new_records)} new records to Supabase!")  # Debug - hidden
             else:
                 if duplicates_found > 0:
-                    st.info(f"📊 No new records found in CSV. {duplicates_found} records already exist in Supabase.")
+                    pass
                 else:
-                    st.info("📊 No new records found in CSV.")
+                    pass
         
         return True
-                    pass
-            
-            return True
         
     except Exception as e:
         st.error(f"❌ Merge failed: {str(e)}")

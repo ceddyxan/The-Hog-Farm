@@ -17,6 +17,7 @@ import threading
 import time
 import hashlib
 import uuid
+import shutil
 
 # Global utility functions
 def safe_float(value):
@@ -668,10 +669,61 @@ def migrate_csv_to_supabase():
                     save_financial_transaction_to_db(row.to_dict())
         
         st.success("✅ Migration completed successfully!")
+        backup_and_clear_csv()
         return True
         
     except Exception as e:
         st.error(f"❌ Migration failed: {str(e)}")
+        return False
+
+def backup_and_clear_csv():
+    """Backup current CSV and clear it after successful Supabase sync"""
+    try:
+        if not os.path.exists(FINANCIAL_DATA_FILE):
+            st.info("📁 CSV file doesn't exist, no backup needed")
+            return True
+        
+        # Read current CSV data
+        current_data = pd.read_csv(FINANCIAL_DATA_FILE)
+        if current_data.empty:
+            st.info("📁 CSV file is empty, no backup needed")
+            return True
+        
+        # Create backup with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_file = f"financial_data_backup_{timestamp}.csv"
+        
+        # Create backup
+        shutil.copy2(FINANCIAL_DATA_FILE, backup_file)
+        
+        # Clear CSV (keep headers only)
+        headers = ['Date', 'Type', 'Category', 'Description', 'Amount', 'Buyer', 'Subcategory', 'Hog ID', 'Weight (kg)', 'Price/kg']
+        pd.DataFrame(columns=headers).to_csv(FINANCIAL_DATA_FILE, index=False)
+        
+        # Log the backup operation
+        if 'enhanced_audit' in globals():
+            enhanced_audit.log_transaction(
+                'backup', 'financial_data', 'csv_backup',
+                status='success',
+                additional_data={
+                    'backup_file': backup_file,
+                    'records_backed_up': len(current_data),
+                    'timestamp': timestamp
+                }
+            )
+        
+        st.success(f"📁 CSV backed up to {backup_file} and cleared after sync ({len(current_data)} records)")
+        return True
+        
+    except Exception as e:
+        st.error(f"⚠️ Backup failed: {str(e)}")
+        # Log the backup failure
+        if 'enhanced_audit' in globals():
+            enhanced_audit.log_transaction(
+                'backup', 'financial_data', 'csv_backup',
+                status='failed',
+                error_message=str(e)
+            )
         return False
 
 def merge_csv_to_supabase(call_reason="unknown"):
@@ -745,6 +797,11 @@ def merge_csv_to_supabase(call_reason="unknown"):
                 # Update session cache to mark these records as processed
                 processed_ids = new_records['unique_id'].tolist()
                 st.session_state['processed_csv_records'].update(processed_ids)
+                
+                # Clean up CSV after successful merge for auto_sync calls
+                if call_reason == "auto_sync" and len(new_records) > 0:
+                    st.info("🧹 Cleaning up CSV after successful sync to Supabase...")
+                    backup_and_clear_csv()
                 
                 # st.success(f"✅ Successfully merged {len(new_records)} new records to Supabase!")  # Debug - hidden
             else:
